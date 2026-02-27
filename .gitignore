@@ -1,0 +1,21 @@
+# Elmer large output files
+*.msh
+elmer_mesh/
+*.ep
+*.result
+ELMERSOLVER_STARTINFO
+
+# Python cache
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# Results — keep PNGs, ignore large VTU mesh files
+step02_electrodes/results/*/results/
+step01_box/results/case_t0001.vtu
+
+# VS Code
+.vscode/
+.claude/
