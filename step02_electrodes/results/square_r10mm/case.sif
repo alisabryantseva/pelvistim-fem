@@ -1,0 +1,68 @@
+Header
+  CHECK KEYWORDS Warn
+  Mesh DB "." "elmer_mesh"
+  Include Path ""
+  Results Directory "results"
+End
+
+Simulation
+  Max Output Level = 3
+  Coordinate System = Cartesian 3D
+  Coordinate Mapping(3) = 1 2 3
+  Simulation Type = Steady State
+  Steady State Max Iterations = 1
+  Output Intervals = 1
+End
+
+Constants
+  Permittivity of Vacuum = 8.8542e-12
+End
+
+Body 1
+  Target Bodies(1) = 1
+  Name = "tissue"
+  Equation = 1
+  Material = 1
+End
+
+Equation 1
+  Name = "Conduction"
+  Active Solvers(2) = 1 2
+End
+
+Solver 1
+  Equation = "Static Current Conduction"
+  Procedure = "StatCurrentSolve" "StatCurrentSolver"
+  Variable = "Potential"
+  Variable DOFs = 1
+  Calculate Volume Current = True
+  Linear System Solver = Direct
+  Linear System Direct Method = UMFPACK
+  Steady State Convergence Tolerance = 1.0e-8
+End
+
+Solver 2
+  Equation = "ResultOutput"
+  Procedure = "ResultOutputSolve" "ResultOutputSolver"
+  Output File Name = "case"
+  Output Format = VTU
+  VTU Format = Logical True
+  Save Geometry IDs = Logical True
+End
+
+Material 1
+  Name = "Tissue"
+  Electric Conductivity = 0.2
+End
+
+Boundary Condition 1
+  Name = "active"
+  Target Boundaries = 101
+  Potential = 1.0
+End
+
+Boundary Condition 2
+  Name = "return"
+  Target Boundaries = 102
+  Potential = 0.0
+End
