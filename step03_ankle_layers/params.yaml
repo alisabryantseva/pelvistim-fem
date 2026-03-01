@@ -1,0 +1,47 @@
+# step03_ankle_layers/params.yaml
+# =============================================================================
+# ANKLE-LIKE LAYERED SLAB — tibial nerve stimulation model
+# =============================================================================
+# ALL CONDUCTIVITY AND THICKNESS VALUES ARE PLACEHOLDERS.
+# Replace with literature / measurement values before drawing conclusions.
+# See README.md § "How to plug in real parameters".
+# =============================================================================
+
+geometry:
+  Lx: 0.12        # medial-lateral width (m)       ~12 cm
+  Ly: 0.09        # anterior-posterior depth (m)    ~9 cm
+  Lz: 0.040       # total slab depth (m)            ~4 cm
+
+layers:
+  t_skin: 0.0015  # skin thickness (m)  ~1.5 mm  — PLACEHOLDER
+  t_fat:  0.005   # default fat thickness (m)  ~5 mm  — PLACEHOLDER
+                  # fat thickness sweep list (m); t_muscle = Lz - t_skin - t_fat
+  t_fat_sweep: [0.003, 0.005, 0.008]
+
+# PLACEHOLDER conductivities — replace with literature values.
+# Ordering (skin < fat < muscle) is directionally reasonable but not calibrated.
+conductivities:
+  sigma_skin:    0.0002   # S/m  literature range: ~0.0001–0.001
+  sigma_fat:     0.040    # S/m  literature range: ~0.01–0.06
+  sigma_muscle:  0.350    # S/m  literature range: ~0.1–0.5 (isotropic approx)
+
+electrodes:
+  shape:    circle          # "circle" or "square"
+  size_list: [0.005, 0.010, 0.015]   # radii (m): 5, 10, 15 mm
+  medial_offset:  0.025    # x-position of active electrode center (m from medial edge)
+  lateral_offset: 0.025    # distance from lateral edge to return center (m)
+  #   active  center: x = medial_offset
+  #   return  center: x = Lx - lateral_offset
+
+mesh:
+  lc_elec_factor: 0.30     # lc_elec = r * factor  (fine under electrode)
+  lc_bulk_cap:    0.010    # max element size in bulk (m)
+  lc_skin_min:    0.0005   # min element size (resolves thin skin layer) (m)
+
+roi:
+  z_target:   0.010   # depth below skin surface for tibial nerve ROI (m)  ~10 mm
+  roi_radius: 0.005   # ROI sphere radius (m)  ~5 mm
+
+solver:
+  tolerance:     1.0e-8
+  linear_solver: UMFPACK
