@@ -106,7 +106,7 @@ Layer order bottom → top: **muscle → fat → skin**
 | `t_fat_sweep` | [3, 5, 8] mm | Fat thicknesses in full sweep |
 | t_muscle | computed | `Lz − t_skin − t_fat` |
 
-### Conductivities — ⚠️ ALL PLACEHOLDERS
+### Conductivities — ALL PLACEHOLDERS
 
 ```yaml
 sigma_skin:    0.001   # S/m  effective dry-electrode value — PLACEHOLDER
