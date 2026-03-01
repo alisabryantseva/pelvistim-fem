@@ -5,8 +5,10 @@ Runs a single coarse case (--smoke flag) and asserts:
   1. VTU output file exists
   2. Potential field: finite, range [0, 1] V (Dirichlet BCs)
   3. Current density field: finite, no NaNs
-  4. Approximate current conservation at electrode patches (flux_err < 5%)
-  5. ROI mean |J| is positive and finite
+  4. Electric field present in VTU
+  5. Current conservation at electrode patches (flux_err < 5%)
+  6. total_current_A is positive and finite
+  7. ROI mean |J| is positive and finite (cell-based, never NaN)
 
 Usage (from step03_ankle_layers/):
     python3 smoke_test.py
@@ -106,8 +108,22 @@ def main():
         passed.append(check("Current density is finite (no NaN/Inf)", finite_J,
                             f"max|J|={Jmag.max():.3f} A/m²"))
 
-    # ── 4. Current conservation ───────────────────────────────────────────────
-    # Read flux_err from summary.json (computed inside extract_results)
+    # ── 4. Electric field computable from potential ───────────────────────────
+    # Elmer StatCurrentSolve doesn't export E directly; we compute E = -∇φ
+    # using pyvista's compute_derivative. Check it runs without error here.
+    has_phi_check = "potential" in mesh.point_data
+    if has_phi_check:
+        try:
+            mc = mesh.point_data_to_cell_data()
+            gm = mc.compute_derivative(scalars="potential")
+            E_cells = -np.array(gm.cell_data["gradient"])
+            Emag_ok = np.all(np.isfinite(E_cells))
+        except Exception as exc:
+            Emag_ok = False
+            print(f"    E gradient error: {exc}")
+        passed.append(check("E = -∇φ computable and finite", Emag_ok))
+
+    # ── 5. summary.json + quantitative checks ────────────────────────────────
     json_path = RESULTS_DIR / "summary.json"
     has_json  = json_path.exists()
     passed.append(check("summary.json exists", has_json))
@@ -119,6 +135,7 @@ def main():
                     and abs(r["elec_r_mm"] - elec_r*1000) < 0.1), None)
 
         if row is not None:
+            # ── 5a. Current conservation ──────────────────────────────────────
             flux_err = row.get("flux_err", float("nan"))
             ok_flux  = np.isfinite(flux_err) and flux_err < FLUX_TOL
             passed.append(check(
@@ -127,21 +144,25 @@ def main():
                 f"flux_err = {flux_err:.3%}"
             ))
 
-            # ── 5. ROI mean |J| ───────────────────────────────────────────────
+            # ── 5b. Total injected current finite and positive ─────────────────
+            I_total = row.get("total_current_A", float("nan"))
+            ok_I = np.isfinite(I_total) and I_total > 0
+            passed.append(check(
+                "total_current_A is positive and finite",
+                ok_I,
+                f"total_current_A = {I_total:.4e} A"
+            ))
+
+            # ── 5c. ROI mean |J| — cell-based, never NaN ──────────────────────
             roi_J = row.get("mean_J_roi", float("nan"))
-            roi_n  = row.get("roi_n_nodes", 0)
-            if roi_n < 5:
-                # Coarse mesh under-samples the ROI sphere — treat as warning,
-                # not a hard failure (full-mesh run will have enough nodes)
-                print(f"  [WARN]  ROI under-sampled (only {roi_n} nodes in ROI sphere) — "
-                      f"coarse mesh expected; run without --smoke for fine-mesh results")
-            else:
-                ok_roi = np.isfinite(roi_J) and roi_J > ROI_MIN
-                passed.append(check(
-                    "ROI mean |J| is positive and finite",
-                    ok_roi,
-                    f"mean_J_roi={roi_J:.5f} A/m²  roi_nodes={roi_n}"
-                ))
+            roi_n = row.get("roi_n_cells", 0)
+            roi_r = row.get("roi_radius_used_mm", "?")
+            ok_roi = np.isfinite(roi_J) and roi_J > ROI_MIN
+            passed.append(check(
+                "ROI mean |J| is positive and finite",
+                ok_roi,
+                f"mean_J_roi={roi_J:.5f} A/m²  roi_n_cells={roi_n}  r_used={roi_r}mm"
+            ))
         else:
             print("  [SKIP]  Could not find matching row in summary.json")
 

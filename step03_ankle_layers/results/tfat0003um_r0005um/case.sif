@@ -1,0 +1,94 @@
+Header
+  CHECK KEYWORDS Warn
+  Mesh DB "." "elmer_mesh"
+  Include Path ""
+  Results Directory "results"
+End
+
+Simulation
+  Max Output Level = 3
+  Coordinate System = Cartesian 3D
+  Coordinate Mapping(3) = 1 2 3
+  Simulation Type = Steady State
+  Steady State Max Iterations = 1
+  Output Intervals = 1
+End
+
+Constants
+  Permittivity of Vacuum = 8.8542e-12
+End
+
+! ── Three tissue bodies (muscle / fat / skin) ────────────────────────────────
+Body 1
+  Name = "muscle"
+  Target Bodies(1) = 1
+  Equation = 1
+  Material = 1
+End
+
+Body 2
+  Name = "fat"
+  Target Bodies(1) = 2
+  Equation = 1
+  Material = 2
+End
+
+Body 3
+  Name = "skin"
+  Target Bodies(1) = 3
+  Equation = 1
+  Material = 3
+End
+
+Equation 1
+  Name = "Conduction"
+  Active Solvers(2) = 1 2
+End
+
+Solver 1
+  Equation = "Static Current Conduction"
+  Procedure = "StatCurrentSolve" "StatCurrentSolver"
+  Variable = "Potential"
+  Variable DOFs = 1
+  Calculate Volume Current = True
+  Linear System Solver = Direct
+  Linear System Direct Method = UMFPACK
+  Steady State Convergence Tolerance = 1e-08
+End
+
+Solver 2
+  Equation = "ResultOutput"
+  Procedure = "ResultOutputSolve" "ResultOutputSolver"
+  Output File Name = "case"
+  Output Format = VTU
+  VTU Format = Logical True
+  Save Geometry IDs = Logical True
+End
+
+! ── PLACEHOLDER conductivities — replace with measured values ─────────────────
+Material 1
+  Name = "muscle"
+  Electric Conductivity = 0.35   ! PLACEHOLDER S/m
+End
+
+Material 2
+  Name = "fat"
+  Electric Conductivity = 0.04      ! PLACEHOLDER S/m
+End
+
+Material 3
+  Name = "skin"
+  Electric Conductivity = 0.001     ! PLACEHOLDER effective S/m (dry electrode)
+End
+
+Boundary Condition 1
+  Name = "active_electrode"
+  Target Boundaries = 101
+  Potential = 1.0
+End
+
+Boundary Condition 2
+  Name = "return_electrode"
+  Target Boundaries = 102
+  Potential = 0.0
+End

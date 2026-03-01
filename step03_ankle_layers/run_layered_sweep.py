@@ -2,7 +2,8 @@
 run_layered_sweep.py — ankle-like layered slab, bipolar electrode sweep
 =======================================================================
 Geometry: 3-layer slab (skin / fat / muscle) with two surface electrodes.
-Active electrode (medial, +1V) and return electrode (lateral, 0V).
+Active electrode (medial, +1V or current-controlled) and return electrode
+(lateral, 0V).
 
 Usage (from step03_ankle_layers/):
     python3 run_layered_sweep.py             # full sweep from params.yaml
@@ -10,6 +11,20 @@ Usage (from step03_ankle_layers/):
 
 Outputs: results/<case>/  with VTU + case.sif
          results/summary.csv  + results/summary.json
+
+Metrics in summary:
+  peak_J_skin        — max |J| at skin surface (comfort proxy)
+  mean_J_roi         — mean |J| in ROI sphere (efficacy proxy), NEVER NaN
+  roi_mean_E         — mean |E| in ROI sphere (if electric field exported)
+  total_current_A    — total injected current (surface integral of J·n)
+  peak_J_skin_per_A  — peak_J_skin normalised by total_current_A  [A/m² per A]
+  roi_mean_J_per_A   — mean_J_roi  normalised by total_current_A
+  roi_mean_E_per_A   — roi_mean_E  normalised by total_current_A  [V/m per A]
+  flux_err           — |I_active - I_return| / max(...)  (conservation check)
+  roi_n_cells        — number of FEM cells inside the ROI sphere used
+  roi_radius_used_mm — actual ROI radius (may be expanded from params default)
+  sigma_skin         — skin conductivity used in this case
+  control_mode       — "voltage" or "current"
 """
 
 import sys
@@ -66,7 +81,7 @@ def build_mesh(p, t_fat, elec_r, run_dir, coarse=False):
     scale = 2.0 if coarse else 1.0
     lc_elec = elec_r * m["lc_elec_factor"] * scale
     lc_bulk = min(elec_r * 4, m["lc_bulk_cap"]) * scale
-    lc_min  = m["lc_skin_min"]   # keep this fixed so skin is always resolved
+    lc_min  = m["lc_skin_min"]   # keep fixed so skin layer is always resolved
 
     z0_fat  = t_muscle
     z0_skin = t_muscle + t_fat
@@ -154,7 +169,7 @@ def build_mesh(p, t_fat, elec_r, run_dir, coarse=False):
     return n_nodes, np.array([medial_x, elec_y, Lz]), np.array([lateral_x, elec_y, Lz])
 
 
-# ── 2. Detect Elmer boundary IDs for the two electrodes ──────────────────────
+# ── 2. Detect Elmer boundary IDs for the two electrodes ──��───────────────────
 def detect_elec_bc_ids(elmer_mesh_dir, e1_pos, e2_pos, Lz):
     nodes = {}
     with open(elmer_mesh_dir / "mesh.nodes") as f:
@@ -275,7 +290,7 @@ Solver 2
   Save Geometry IDs = Logical True
 End
 
-! ── PLACEHOLDER conductivities — replace with literature values ───────────────
+! ── PLACEHOLDER conductivities — replace with measured values ─────────────────
 Material 1
   Name = "muscle"
   Electric Conductivity = {sigma_muscle}   ! PLACEHOLDER S/m
@@ -288,13 +303,13 @@ End
 
 Material 3
   Name = "skin"
-  Electric Conductivity = {sigma_skin}     ! PLACEHOLDER S/m
+  Electric Conductivity = {sigma_skin}     ! PLACEHOLDER effective S/m (dry electrode)
 End
 
 Boundary Condition 1
   Name = "active_electrode"
   Target Boundaries = {e1_id}
-  Potential = 1.0
+{bc1_active}
 End
 
 Boundary Condition 2
@@ -305,16 +320,36 @@ End
 """
 
 
-def write_sif(run_dir, e1_id, e2_id, p):
+def write_sif(run_dir, e1_id, e2_id, p, elec_r, sigma_skin_override=None):
     c  = p["conductivities"]
     sv = p["solver"]
+    ep = p["electrodes"]
+    ctrl = p.get("control", {})
+    mode = ctrl.get("control_mode", "voltage")
+
+    sigma_skin = sigma_skin_override if sigma_skin_override is not None \
+        else c["sigma_skin"]
+
+    if mode == "voltage":
+        bc1_active = "  Potential = 1.0"
+    else:  # current
+        I_A = ctrl.get("injected_current_mA", 5.0) * 1e-3
+        shape = ep["shape"]
+        area = np.pi * elec_r**2 if shape == "circle" else (2 * elec_r)**2
+        # σ ∂φ/∂n = I/A > 0  (outward n = +z at top face → current into tissue)
+        jn = I_A / area
+        bc1_active = (f"  Current Density = {jn:.6e}  "
+                      f"! I={I_A*1e3:.1f}mA uniform; A={area*1e4:.3f}cm²")
+
     sif = SIF_TEMPLATE.format(
         sigma_muscle=c["sigma_muscle"],
         sigma_fat=c["sigma_fat"],
-        sigma_skin=c["sigma_skin"],
-        e1_id=e1_id, e2_id=e2_id,
+        sigma_skin=sigma_skin,
+        e1_id=e1_id,
+        e2_id=e2_id,
         tol=sv["tolerance"],
         lin_solver=sv["linear_solver"],
+        bc1_active=bc1_active,
     )
     (run_dir / "case.sif").write_text(sif)
 
@@ -329,8 +364,106 @@ def _run(cmd, cwd, label):
         sys.exit(1)
 
 
-# ── 5. Extract results from VTU ───────────────────────────────────────────────
-def extract_results(run_dir, p, t_fat, elec_r, e1_pos3d, e2_pos3d, elec_shape):
+# ── 5a. Compute total injected current (surface integration) ──────────────────
+def compute_injected_current(mesh, e1_pos3d, e2_pos3d, elec_r, Lz):
+    """
+    Integrate J·dA over the active and return electrode patches on the top face.
+
+    At the top face (z = Lz), the outward normal is +z, so J·n_outward = J_z.
+    For current flowing INTO the tissue, J_z < 0, so
+        I_injected = |∑ J_z * cell_area|  over active patch.
+
+    Returns: (I_active_A, I_return_A, flux_err)
+    """
+    tol_z = Lz * 5e-3
+
+    surface    = mesh.extract_surface(algorithm="dataset_surface")
+    surface_cd = surface.point_data_to_cell_data()
+    J_cells    = np.array(surface_cd.cell_data["volume current"])  # (N_surf, 3)
+    cell_pts   = np.array(surface.cell_centers().points)           # (N_surf, 3)
+
+    sizes = surface.compute_cell_sizes()
+    areas = np.array(sizes.cell_data["Area"])                      # (N_surf,)
+
+    active_mask = ((cell_pts[:, 2] > Lz - tol_z) &
+                   (np.linalg.norm(cell_pts[:, :2] - e1_pos3d[:2], axis=1) < elec_r * 1.2))
+    return_mask = ((cell_pts[:, 2] > Lz - tol_z) &
+                   (np.linalg.norm(cell_pts[:, :2] - e2_pos3d[:2], axis=1) < elec_r * 1.2))
+
+    if not active_mask.any() or not return_mask.any():
+        return np.nan, np.nan, np.nan
+
+    # J_z = J·n_outward at top face
+    I_active = float(abs(np.sum(J_cells[active_mask, 2] * areas[active_mask])))
+    I_return = float(abs(np.sum(J_cells[return_mask, 2] * areas[return_mask])))
+    denom    = max(I_active, I_return)
+    flux_err = float(abs(I_active - I_return) / denom) if denom > 0 else np.nan
+
+    return I_active, I_return, flux_err
+
+
+# ── 5b. Evaluate ROI using cell data (robust, never NaN) ─────────────────────
+def eval_roi(mesh, roi_cen, roi_radius_init, min_cells=4):
+    """
+    Compute mean |J| and mean |E| inside a spherical ROI using cell-centroid data.
+
+    If fewer than min_cells cells are found at the initial radius, the radius is
+    expanded (×1.5, ×2, ×3) until enough cells are collected.  A warning is
+    printed if expansion occurs; a value is always returned (never NaN from
+    under-sampling).
+
+    Returns: (mean_J, mean_E, n_cells, roi_radius_used, warning_str_or_None)
+    """
+    mesh_cd    = mesh.point_data_to_cell_data()
+    J_cells    = np.array(mesh_cd.cell_data["volume current"])
+    Jmag_cells = np.linalg.norm(J_cells, axis=1)
+
+    # Compute E = -∇φ at cell centres via pyvista gradient (more reliable than
+    # asking Elmer to export it — StatCurrentSolve doesn't always do so).
+    try:
+        grad_mesh  = mesh_cd.compute_derivative(scalars="potential")
+        E_cells    = -np.array(grad_mesh.cell_data["gradient"])  # E = -∇φ
+        Emag_cells = np.linalg.norm(E_cells, axis=1)
+    except Exception:
+        Emag_cells = None
+
+    cell_pts = np.array(mesh_cd.cell_centers().points)
+    dist     = np.linalg.norm(cell_pts - roi_cen, axis=1)
+
+    warning          = None
+    roi_radius_used  = roi_radius_init
+
+    for mult in [1.0, 1.5, 2.0, 3.0]:
+        r_test = roi_radius_init * mult
+        mask   = dist < r_test
+        n      = int(mask.sum())
+        if n >= min_cells:
+            roi_radius_used = r_test
+            if mult > 1.0:
+                warning = (f"ROI radius expanded {mult:.1f}x to "
+                           f"{r_test*1000:.1f} mm  ({n} cells found)")
+            break
+    else:
+        roi_radius_used = roi_radius_init * 3.0
+        mask   = dist < roi_radius_used
+        n      = int(mask.sum())
+        warning = (f"ROI at 3x expansion ({roi_radius_used*1000:.1f} mm) "
+                   f"has only {n} cells — results may be noisy")
+
+    n = int(mask.sum())
+    if n == 0:
+        return (np.nan, np.nan, 0, roi_radius_used,
+                "No cells in ROI even at 3x expansion")
+
+    mean_J = float(Jmag_cells[mask].mean())
+    mean_E = float(Emag_cells[mask].mean()) if Emag_cells is not None else np.nan
+
+    return mean_J, mean_E, n, roi_radius_used, warning
+
+
+# ── 5c. Extract all metrics from VTU ──────────────────────────────────────────
+def extract_results(run_dir, p, t_fat, elec_r, e1_pos3d, e2_pos3d, elec_shape,
+                    sigma_skin_used=None):
     vtu_path = run_dir / "results" / "case_t0001.vtu"
     if not vtu_path.exists():
         raise FileNotFoundError(f"VTU not found: {vtu_path}")
@@ -344,80 +477,104 @@ def extract_results(run_dir, p, t_fat, elec_r, e1_pos3d, e2_pos3d, elec_shape):
     Lx, Ly, Lz = g["Lx"], g["Ly"], g["Lz"]
     tol_z = Lz * 5e-3
 
-    # ── Skin surface (z ≈ Lz) ─────────────────────────────────────────────────
-    skin_mask = pts[:, 2] > Lz - tol_z
+    # ── Peak |J| at skin surface (node-based, z ≈ Lz) ────────────────────────
+    skin_mask   = pts[:, 2] > Lz - tol_z
+    peak_J_skin = float(Jmag[skin_mask].max()) if skin_mask.any() else np.nan
 
-    # ── Electrode footprint (nodes within 1.2×r of electrode center on skin) ──
-    r_to_e1 = np.linalg.norm(pts[:, :2] - e1_pos3d[:2], axis=1)
-    r_to_e2 = np.linalg.norm(pts[:, :2] - e2_pos3d[:2], axis=1)
-    active_mask = skin_mask & (r_to_e1 < elec_r * 1.2)
-    return_mask = skin_mask & (r_to_e2 < elec_r * 1.2)
+    # ── Total injected current (surface integration) ──────────────────────────
+    I_active, I_return, flux_err = compute_injected_current(
+        mesh, e1_pos3d, e2_pos3d, elec_r, Lz)
+    print(f"    I_active={I_active:.4e} A  "
+          f"I_return={I_return:.4e} A  "
+          f"flux_err={flux_err:.2e}")
 
-    peak_J_active = Jmag[active_mask].max() if active_mask.any() else np.nan
-    peak_J_return = Jmag[return_mask].max() if return_mask.any() else np.nan
-    peak_J_skin   = max(peak_J_active, peak_J_return)
+    # ── ROI (cell-based, auto-expanding) ──────────────────────────────────────
+    r_cfg    = p["roi"]
+    z_nerve  = Lz - r_cfg["z_target"]
+    roi_cen  = np.array([e1_pos3d[0], e1_pos3d[1], z_nerve])
 
-    # ── Approx current conservation: flux through electrode patches ───────────
-    flux_active = np.abs(J[active_mask, 2]).mean() if active_mask.any() else np.nan
-    flux_return = np.abs(J[return_mask, 2]).mean() if return_mask.any() else np.nan
-    if np.isfinite(flux_active) and np.isfinite(flux_return):
-        flux_err = abs(flux_active - flux_return) / max(flux_active, flux_return)
-    else:
-        flux_err = np.nan
+    mean_J_roi, mean_E_roi, roi_n_cells, roi_r_used, roi_warn = eval_roi(
+        mesh, roi_cen, r_cfg["roi_radius"])
 
-    # ── ROI under medial electrode (tibial nerve proxy) ───────────────────────
-    r_cfg   = p["roi"]
-    z_nerve = Lz - r_cfg["z_target"]
-    roi_cen = np.array([e1_pos3d[0], e1_pos3d[1], z_nerve])
-    dist    = np.linalg.norm(pts - roi_cen, axis=1)
-    roi_mask = dist < r_cfg["roi_radius"]
+    if roi_warn:
+        print(f"    ROI: {roi_warn}")
 
-    if roi_mask.sum() < 3:
-        mean_J_roi = np.nan
-    else:
-        mean_J_roi = Jmag[roi_mask].mean()
-
-    # ── Layer thickness at ROI depth — warn if not in muscle ─────────────────
+    # ── Layer at ROI depth ────────────────────────────────────────────────────
     t_skin    = p["layers"]["t_skin"]
     z_fat_bot = Lz - t_skin - t_fat
     roi_layer = ("skin"   if z_nerve > Lz - t_skin
                  else "fat"    if z_nerve > z_fat_bot
                  else "muscle")
 
-    if elec_shape == "circle":
-        area = np.pi * elec_r**2
-    else:
-        area = (2 * elec_r)**2
+    # ── Electrode area ────────────────────────────────────────────────────────
+    area = np.pi * elec_r**2 if elec_shape == "circle" else (2 * elec_r)**2
 
-    tradeoff = mean_J_roi / peak_J_skin if peak_J_skin > 0 else np.nan
+    # ── Normalise by injected current ─────────────────────────────────────────
+    I_ref = I_active if np.isfinite(I_active) and I_active > 0 else np.nan
+
+    def _norm(val):
+        v = float(val)
+        return v / I_ref if np.isfinite(v) and np.isfinite(I_ref) else np.nan
+
+    peak_J_skin_per_A = _norm(peak_J_skin)
+    roi_mean_J_per_A  = _norm(mean_J_roi)
+    roi_mean_E_per_A  = _norm(mean_E_roi)
+
+    # ── Tradeoff (ROI / skin peak, raw values) ────────────────────────────────
+    tradeoff = (float(mean_J_roi) / peak_J_skin
+                if peak_J_skin > 0 and np.isfinite(mean_J_roi)
+                else np.nan)
+
+    # ── Which sigma_skin was used ─────────────────────────────────────────────
+    c    = p["conductivities"]
+    ctrl = p.get("control", {})
+    sig  = sigma_skin_used if sigma_skin_used is not None else c["sigma_skin"]
+
+    def _r(val, n):
+        v = float(val)
+        return round(v, n) if np.isfinite(v) else v   # returns float nan if nan
 
     return {
-        "t_fat_mm":       round(t_fat * 1000, 2),
-        "elec_r_mm":      round(elec_r * 1000, 2),
-        "elec_area_cm2":  round(area * 1e4, 4),
-        "elec_shape":     elec_shape,
-        "peak_J_skin":    round(float(peak_J_skin), 4),
-        "mean_J_roi":     round(float(mean_J_roi), 4),
-        "tradeoff":       round(float(tradeoff), 6),
-        "flux_err":       round(float(flux_err), 6),
-        "roi_layer":      roi_layer,
-        "roi_n_nodes":    int(roi_mask.sum()),
+        "t_fat_mm":           _r(t_fat * 1000, 2),
+        "elec_r_mm":          _r(elec_r * 1000, 2),
+        "elec_area_cm2":      _r(area * 1e4, 4),
+        "elec_shape":         elec_shape,
+        "sigma_skin":         sig,
+        "control_mode":       ctrl.get("control_mode", "voltage"),
+        "peak_J_skin":        _r(peak_J_skin, 6),
+        "mean_J_roi":         _r(mean_J_roi, 6),
+        "roi_mean_E":         _r(mean_E_roi, 4),
+        "total_current_A":    _r(I_active, 8),
+        "peak_J_skin_per_A":  _r(peak_J_skin_per_A, 4),
+        "roi_mean_J_per_A":   _r(roi_mean_J_per_A, 4),
+        "roi_mean_E_per_A":   _r(roi_mean_E_per_A, 4),
+        "tradeoff":           _r(tradeoff, 6),
+        "flux_err":           _r(flux_err, 6),
+        "roi_layer":          roi_layer,
+        "roi_n_cells":        roi_n_cells,
+        "roi_radius_used_mm": _r(roi_r_used * 1000, 2),
     }
 
 
 # ── 6. Main sweep ─────────────────────────────────────────────────────────────
-def run_sweep(p, t_fat_list, elec_r_list, coarse=False):
+def run_sweep(p, t_fat_list, elec_r_list, coarse=False, sigma_skin_override=None):
     RESULTS_DIR.mkdir(exist_ok=True)
     all_results = []
+
+    sigma_skin = (sigma_skin_override
+                  if sigma_skin_override is not None
+                  else p["conductivities"]["sigma_skin"])
 
     for t_fat in t_fat_list:
         for elec_r in elec_r_list:
             label = f"tfat{int(t_fat*1000):04d}um_r{int(elec_r*1000):04d}um"
             run_dir = RESULTS_DIR / label
-            print(f"\n[{label}]  t_fat={t_fat*1000:.1f}mm  r={elec_r*1000:.1f}mm")
+            print(f"\n[{label}]  t_fat={t_fat*1000:.1f}mm  r={elec_r*1000:.1f}mm  "
+                  f"sigma_skin={sigma_skin}")
 
             print("  meshing ...")
-            n_nodes, e1_pos, e2_pos = build_mesh(p, t_fat, elec_r, run_dir, coarse=coarse)
+            n_nodes, e1_pos, e2_pos = build_mesh(p, t_fat, elec_r, run_dir,
+                                                  coarse=coarse)
             print(f"    {n_nodes} nodes")
 
             print("  ElmerGrid ...")
@@ -427,10 +584,12 @@ def run_sweep(p, t_fat_list, elec_r_list, coarse=False):
                  cwd=run_dir, label="ElmerGrid")
 
             print("  detecting electrode BCs ...")
-            e1_id, e2_id = detect_elec_bc_ids(elmer_dir, e1_pos, e2_pos, p["geometry"]["Lz"])
+            e1_id, e2_id = detect_elec_bc_ids(
+                elmer_dir, e1_pos, e2_pos, p["geometry"]["Lz"])
             print(f"    active={e1_id}  return={e2_id}")
 
-            write_sif(run_dir, e1_id, e2_id, p)
+            write_sif(run_dir, e1_id, e2_id, p, elec_r,
+                      sigma_skin_override=sigma_skin_override)
             (run_dir / "results").mkdir(exist_ok=True)
 
             print("  ElmerSolver ...")
@@ -438,31 +597,34 @@ def run_sweep(p, t_fat_list, elec_r_list, coarse=False):
 
             print("  extracting metrics ...")
             res = extract_results(run_dir, p, t_fat, elec_r, e1_pos, e2_pos,
-                                  p["electrodes"]["shape"])
-            print(f"    peak_J_skin={res['peak_J_skin']:.2f}  "
-                  f"mean_J_roi={res['mean_J_roi']:.4f}  "
+                                  p["electrodes"]["shape"],
+                                  sigma_skin_used=sigma_skin)
+            print(f"    peak_J_skin={res['peak_J_skin']:.4f}  "
+                  f"mean_J_roi={res['mean_J_roi']:.6f}  "
                   f"tradeoff={res['tradeoff']:.4f}  "
-                  f"flux_err={res['flux_err']:.2e}")
+                  f"roi_n_cells={res['roi_n_cells']}")
             all_results.append(res)
 
     return all_results
 
 
 def save_results(all_results):
+    if not all_results:
+        return
     # CSV
     csv_path = RESULTS_DIR / "summary.csv"
-    if all_results:
-        keys = list(all_results[0].keys())
-        with open(csv_path, "w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=keys)
-            w.writeheader()
-            w.writerows(all_results)
-        print(f"\nSaved → {csv_path}")
+    keys = list(all_results[0].keys())
+    with open(csv_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=keys)
+        w.writeheader()
+        w.writerows(all_results)
+    print(f"\nSaved → {csv_path}")
 
     # JSON
     json_path = RESULTS_DIR / "summary.json"
     with open(json_path, "w") as f:
-        json.dump(all_results, f, indent=2)
+        json.dump(all_results, f, indent=2, default=lambda x: None if (
+            isinstance(x, float) and np.isnan(x)) else x)
     print(f"Saved → {json_path}")
 
 
@@ -476,14 +638,14 @@ if __name__ == "__main__":
     p = load_params()
 
     if args.smoke:
-        t_fat_list = [p["layers"]["t_fat"]]
+        t_fat_list  = [p["layers"]["t_fat"]]
         elec_r_list = [p["electrodes"]["size_list"][1]]   # middle size
-        coarse = True
+        coarse      = True
         print("=== SMOKE TEST (1 coarse case) ===")
     else:
         t_fat_list  = p["layers"]["t_fat_sweep"]
         elec_r_list = p["electrodes"]["size_list"]
-        coarse = False
+        coarse      = False
         print(f"=== FULL SWEEP: {len(t_fat_list)} fat thicknesses × "
               f"{len(elec_r_list)} electrode sizes = "
               f"{len(t_fat_list)*len(elec_r_list)} cases ===")

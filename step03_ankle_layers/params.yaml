@@ -5,6 +5,12 @@
 # ALL CONDUCTIVITY AND THICKNESS VALUES ARE PLACEHOLDERS.
 # Replace with literature / measurement values before drawing conclusions.
 # See README.md § "How to plug in real parameters".
+#
+# Electrode model: DRY / REUSABLE electrodes (no added gel).
+# sigma_skin is an EFFECTIVE parameter capturing epidermis + contact impedance.
+# It should remain LOW (~0.001 S/m or below). See sigma_skin_sweep to explore
+# sensitivity. Recommend measuring contact impedance on your electrode/subject
+# combination and using that to calibrate sigma_skin.
 # =============================================================================
 
 geometry:
@@ -18,12 +24,17 @@ layers:
                   # fat thickness sweep list (m); t_muscle = Lz - t_skin - t_fat
   t_fat_sweep: [0.003, 0.005, 0.008]
 
-# PLACEHOLDER conductivities — replace with literature values.
-# Ordering (skin < fat < muscle) is directionally reasonable but not calibrated.
+# PLACEHOLDER conductivities — replace with measured / literature values.
+# sigma_skin represents the EFFECTIVE skin+contact impedance for DRY electrodes.
+# Keeping it low (<<  muscle) is physically appropriate for reusable electrodes.
 conductivities:
-  sigma_skin:    0.0002   # S/m  literature range: ~0.0001–0.001
+  sigma_skin:    0.001    # S/m  effective dry-electrode value (PLACEHOLDER)
   sigma_fat:     0.040    # S/m  literature range: ~0.01–0.06
   sigma_muscle:  0.350    # S/m  literature range: ~0.1–0.5 (isotropic approx)
+
+  # Skin conductivity sweep — run with different values to assess sensitivity.
+  # Higher values = better gel contact; lower = dry / high-impedance.
+  sigma_skin_sweep: [0.0002, 0.001, 0.005]
 
 electrodes:
   shape:    circle          # "circle" or "square"
@@ -40,8 +51,21 @@ mesh:
 
 roi:
   z_target:   0.010   # depth below skin surface for tibial nerve ROI (m)  ~10 mm
-  roi_radius: 0.005   # ROI sphere radius (m)  ~5 mm
+  roi_radius: 0.005   # ROI sphere radius (m)  ~5 mm  (auto-expands if too few cells)
 
 solver:
   tolerance:     1.0e-8
   linear_solver: UMFPACK
+
+# ── Stimulation control mode ──────────────────────────────────────────────────
+# "voltage": fixed potentials on electrodes (active=+1V, return=0V).
+#   Current depends on tissue/contact impedance. Good for comparing geometry;
+#   normalize outputs by total_current_A for cross-case comparison.
+#
+# "current": uniform current density Neumann BC on active electrode (return=0V).
+#   Approximates TENS-like current-regulated stimulators. Outputs directly
+#   comparable across cases. Compliance voltage is not constrained.
+#   Elmer BC: σ ∂φ/∂n = I/A  (outward normal at top face, A = electrode area).
+control:
+  control_mode:        voltage    # "voltage" or "current"
+  injected_current_mA: 5.0        # mA  — used only when control_mode = "current"

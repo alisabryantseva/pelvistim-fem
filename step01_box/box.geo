@@ -23,3 +23,4 @@ Physical Surface(103) = {sides[]};
 
 Mesh.CharacteristicLengthMin = lc;
 Mesh.CharacteristicLengthMax = lc;
+
