@@ -1,16 +1,12 @@
 """
-visualize.py  —  step01_box baseline results
+visualize.py  —  step01_box baseline figures
 Run from step01_box/:   python3 visualize.py
-
-step01 is the UNIFORM electrode baseline (whole top surface = 1V).
-J is flat everywhere — this is the sanity check before step02
-where we model finite electrode patches.
+Outputs: results/step01_summary.png, results/step01_3d.png
 """
 
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.tri as mtri
-import matplotlib.patches as mpatches
 import pyvista as pv
 from pathlib import Path
 
@@ -18,7 +14,8 @@ VTU = Path("results/case_t0001.vtu")
 if not VTU.exists():
     raise SystemExit(f"ERROR: {VTU} not found. Run ElmerSolver first.")
 
-mesh = pv.read(str(VTU))
+# ── Load data ─────────────────────────────────────────────────────────────────
+mesh  = pv.read(str(VTU))
 pts   = np.array(mesh.points)
 phi   = np.array(mesh.point_data["potential"])
 J_vec = np.array(mesh.point_data["volume current"])
@@ -27,160 +24,182 @@ J_mag = np.linalg.norm(J_vec, axis=1)
 Lx = pts[:, 0].max()
 Ly = pts[:, 1].max()
 Lz = pts[:, 2].max()
-J_analytic = 0.2 * (1.0 / Lz)
+J_an = 0.2 / Lz                  # analytic |J| = σ·ΔV/Lz
 
-# ── 3D pyvista render (save first, embed in figure) ───────────────────────────
+# ── 3D pyvista render (saved separately, also embedded) ───────────────────────
 Path("results").mkdir(exist_ok=True)
-pl = pv.Plotter(off_screen=True, window_size=(800, 600))
+pl = pv.Plotter(off_screen=True, window_size=(700, 520))
 pl.set_background("white")
-clipped = mesh.clip(normal="y", origin=[0, Ly * 0.5, 0])
-pl.add_mesh(clipped, scalars="potential", cmap="RdYlBu_r",
+pl.add_mesh(mesh.clip(normal="y", origin=[0, Ly * 0.5, 0]),
+            scalars="potential", cmap="RdYlBu_r",
             show_scalar_bar=True,
-            scalar_bar_args={"title": "Potential (V)", "width": 0.5,
-                             "position_x": 0.25, "position_y": 0.02,
-                             "title_font_size": 14, "label_font_size": 12})
-pl.add_mesh(mesh.outline(), color="black", line_width=2)
+            scalar_bar_args={"title": "V (V)", "width": 0.45,
+                             "position_x": 0.27, "position_y": 0.04,
+                             "title_font_size": 13, "label_font_size": 11})
+pl.add_mesh(mesh.outline(), color="black", line_width=1.5)
 pl.view_isometric()
-pl.camera.zoom(1.15)
-img3d_path = Path("results/step01_3d.png")
-pl.screenshot(str(img3d_path))
+pl.camera.zoom(1.2)
+img3d = Path("results/step01_3d.png")
+pl.screenshot(str(img3d))
 pl.close()
 
-# ── XZ mid-slice helpers ──────────────────────────────────────────────────────
+# ── XZ mid-slice (y ≈ Ly/2) ───────────────────────────────────────────────────
 mask_xz = np.abs(pts[:, 1] - Ly / 2) < Ly * 0.04
-p_xz = pts[mask_xz]
-tri_xz = mtri.Triangulation(p_xz[:, 0], p_xz[:, 2])
-phi_xz = phi[mask_xz]
-J_xz   = J_mag[mask_xz]
-Jvec_xz = J_vec[mask_xz]
+p_xz    = pts[mask_xz]
+tri_xz  = mtri.Triangulation(p_xz[:, 0], p_xz[:, 2])
+phi_xz  = phi[mask_xz]
+Jvec_xz = J_vec[mask_xz]         # (N, 3) for the slice
 
-# center column for 1D profiles
-r_xy = np.sqrt((pts[:, 0] - Lx/2)**2 + (pts[:, 1] - Ly/2)**2)
-center_mask = r_xy < Lx * 0.08
-z_c   = pts[center_mask, 2]
-phi_c = phi[center_mask]
-J_c   = J_mag[center_mask]
-order = np.argsort(z_c)
+# ── Center column (for 1-D profiles) ──────────────────────────────────────────
+r_xy    = np.hypot(pts[:, 0] - Lx / 2, pts[:, 1] - Ly / 2)
+col     = r_xy < Lx * 0.08
+z_c     = pts[col, 2];  phi_c = phi[col];  J_c = J_mag[col]
 
-# ── Figure ────────────────────────────────────────────────────────────────────
-fig = plt.figure(figsize=(17, 9))
+# ── Validation metrics (printed in panel 6) ────────────────────────────────────
+mean_J  = J_mag.mean()
+cv_J    = J_mag.std(ddof=1) / mean_J
+coeffs  = np.polyfit(z_c, phi_c, 1)
+phi_fit = np.polyval(coeffs, z_c)
+r2      = 1.0 - np.sum((phi_c - phi_fit)**2) / np.sum((phi_c - phi_c.mean())**2)
+tol_z   = Lz * 1e-3
+flux_top = np.abs(J_vec[pts[:, 2] > Lz - tol_z, 2]).mean()
+flux_bot = np.abs(J_vec[pts[:, 2] < tol_z,       2]).mean()
+
+# ── Figure: 2×3, constrained layout ──────────────────────────────────────────
+fig, axes = plt.subplots(2, 3, figsize=(15, 8),
+                         constrained_layout=True)
+
 fig.suptitle(
-    "step01 — BASELINE: uniform electrode (entire top surface)\n"
-    "4×4×2 cm tissue box  |  σ = 0.2 S/m  |  top = 1 V, bottom = 0 V  |  "
-    "Current density J is flat everywhere — this is the sanity check",
-    fontsize=11, y=0.98
+    "step01_box — uniform electrode baseline  "
+    r"($\sigma$ = 0.2 S/m, $\Delta V$ = 1 V, box 4×4×2 cm)",
+    fontsize=12, fontweight="bold"
 )
 
-gs = fig.add_gridspec(2, 3, hspace=0.38, wspace=0.32)
+# ── [0,0] Potential — XZ cross-section ───────────────────────────────────────
+ax = axes[0, 0]
+cf = ax.tricontourf(tri_xz, phi_xz, levels=25, cmap="RdYlBu_r",
+                    vmin=0, vmax=1)
+ax.tricontour(tri_xz, phi_xz, levels=8, colors="k",
+              linewidths=0.4, alpha=0.35)
+fig.colorbar(cf, ax=ax, label="Potential (V)", fraction=0.046, pad=0.04)
+ax.set_xlim(0, Lx); ax.set_ylim(0, Lz)
+ax.set_aspect("equal")
+ax.set_xlabel("x (m)"); ax.set_ylabel("z (m)")
+ax.set_title("Potential — XZ cross-section  (y = Ly/2)")
+ax.text(0.02, 0.97, "top: 1 V", transform=ax.transAxes,
+        va="top", fontsize=8, color="firebrick")
+ax.text(0.02, 0.03, "bottom: 0 V", transform=ax.transAxes,
+        va="bottom", fontsize=8, color="navy")
 
-# ── Panel 1: Potential XZ cross-section ──────────────────────────────────────
-ax1 = fig.add_subplot(gs[0, 0])
-tc1 = ax1.tricontourf(tri_xz, phi_xz, levels=30, cmap="RdYlBu_r")
-ax1.tricontour(tri_xz, phi_xz, levels=10, colors="k", linewidths=0.4, alpha=0.4)
-fig.colorbar(tc1, ax=ax1, label="Potential (V)")
-ax1.set_title("Potential — vertical cross-section\n(y = center)")
-ax1.set_xlabel("x (m)"); ax1.set_ylabel("z (m)  ↑")
-ax1.set_aspect("equal")
-ax1.text(0.02, 0.97, "electrode 1V →", transform=ax1.transAxes,
-         fontsize=7, va="top", color="darkred")
-ax1.text(0.02, 0.03, "ground 0V →", transform=ax1.transAxes,
-         fontsize=7, va="bottom", color="navy")
+# ── [0,1] 3D view (embedded pyvista screenshot) ───────────────────────────────
+ax = axes[0, 1]
+ax.imshow(plt.imread(str(img3d)))
+ax.axis("off")
+ax.set_title("3D potential field  (clipped at y = Ly/2)")
 
-# ── Panel 2: 3D view (embedded) ───────────────────────────────────────────────
-ax2 = fig.add_subplot(gs[0, 1])
-img = plt.imread(str(img3d_path))
-ax2.imshow(img)
-ax2.axis("off")
-ax2.set_title("3D potential field\n(clipped at y = center)")
+# ── [0,2] J vectors — XZ cross-section ───────────────────────────────────────
+ax = axes[0, 2]
+# subsample: ~8×8 = 64 arrows on the slice, unit z-direction (J is uniform)
+n_arrows = 64
+idx_all  = np.where(mask_xz)[0]
+step     = max(1, len(idx_all) // n_arrows)
+idx      = idx_all[::step]
+# normalise arrow length to a fixed fraction of Lz so they read cleanly
+J_xz_norm = J_mag[idx]                  # magnitudes (all ~J_an)
+ax.quiver(pts[idx, 0], pts[idx, 2],
+          J_vec[idx, 0] / J_an,          # unit-normalised x
+          J_vec[idx, 2] / J_an,          # unit-normalised z
+          J_xz_norm,
+          cmap="inferno", clim=(0, J_an * 1.05),
+          pivot="mid", scale=30, width=0.005,
+          headwidth=3, headlength=4)
+sm = plt.cm.ScalarMappable(cmap="inferno",
+                            norm=plt.Normalize(0, J_an * 1.05))
+sm.set_array([])
+fig.colorbar(sm, ax=ax, label="|J| (A/m²)", fraction=0.046, pad=0.04)
+ax.set_xlim(0, Lx); ax.set_ylim(0, Lz)
+ax.set_aspect("equal")
+ax.set_xlabel("x (m)"); ax.set_ylabel("z (m)")
+ax.set_title("Current density vectors — XZ cross-section")
+ax.text(0.5, 0.92,
+        f"uniform  |J| = {J_an:.1f} A/m²",
+        transform=ax.transAxes, ha="center", fontsize=8,
+        bbox=dict(facecolor="white", alpha=0.75, edgecolor="none"))
 
-# ── Panel 3: J arrows on XZ slice ────────────────────────────────────────────
-ax3 = fig.add_subplot(gs[0, 2])
-step = max(1, mask_xz.sum() // 100)
-idx = np.where(mask_xz)[0][::step]
-q = ax3.quiver(pts[idx, 0], pts[idx, 2],
-               J_vec[idx, 0], J_vec[idx, 2],
-               J_mag[idx], cmap="inferno",
-               pivot="mid", scale_units="xy",
-               scale=J_mag.max() * 25, width=0.004)
-fig.colorbar(q, ax=ax3, label="|J| (A/m²)")
-ax3.set_title("Current density vectors\n(vertical cross-section)")
-ax3.set_xlabel("x (m)"); ax3.set_ylabel("z (m)")
-ax3.set_xlim(0, Lx); ax3.set_ylim(0, Lz)
-ax3.set_aspect("equal")
-ax3.text(0.5, 0.5, f"All arrows vertical\n|J| = {J_analytic:.1f} A/m²\nuniform",
-         transform=ax3.transAxes, ha="center", va="center",
-         fontsize=8, color="white",
-         bbox=dict(facecolor="black", alpha=0.5, boxstyle="round"))
+# ── [1,0] Potential vs depth — center column ──────────────────────────────────
+ax = axes[1, 0]
+ax.scatter(phi_c, z_c * 100, s=7, alpha=0.55, color="steelblue",
+           label="FEM nodes", zorder=3)
+z_lin = np.linspace(0, Lz, 60)
+ax.plot(z_lin / Lz, z_lin * 100, "r--", lw=1.8, label="Analytic V = z/Lz")
+ax.set_xlim(-0.03, 1.03)
+ax.set_ylim(-0.05 * Lz * 100, Lz * 100 * 1.05)
+ax.set_xlabel("Potential (V)"); ax.set_ylabel("Depth z (cm)")
+ax.set_title("Potential vs depth — center column")
+ax.legend(fontsize=8, framealpha=0.8)
+ax.grid(True, alpha=0.3, linewidth=0.5)
 
-# ── Panel 4: Potential vs depth ───────────────────────────────────────────────
-ax4 = fig.add_subplot(gs[1, 0])
-ax4.scatter(phi_c, z_c * 100, s=6, alpha=0.5, color="steelblue", label="FEM nodes")
-z_lin = np.linspace(0, Lz, 80)
-ax4.plot(z_lin / Lz, z_lin * 100, "r--", lw=2, label="Analytic (linear)")
-ax4.set_xlabel("Potential (V)")
-ax4.set_ylabel("Depth z (cm)")
-ax4.set_title("Potential vs depth — center column")
-ax4.legend(fontsize=8); ax4.grid(True, alpha=0.3)
-ax4.set_xlim(-0.02, 1.02)
+# ── [1,1] |J| vs depth — center column ───────────────────────────────────────
+ax = axes[1, 1]
+ax.scatter(J_c, z_c * 100, s=7, alpha=0.55, color="darkorange",
+           label="FEM nodes", zorder=3)
+ax.axvline(J_an, color="r", ls="--", lw=1.8,
+           label=f"Analytic {J_an:.1f} A/m²")
+J_spread = J_mag.max() - J_mag.min()
+margin   = max(J_spread * 3, J_an * 0.05)
+ax.set_xlim(J_an - margin, J_an + margin)
+ax.set_ylim(-0.05 * Lz * 100, Lz * 100 * 1.05)
+ax.set_xlabel("|J| (A/m²)"); ax.set_ylabel("Depth z (cm)")
+ax.set_title("|J| vs depth — center column")
+ax.legend(fontsize=8, framealpha=0.8)
+ax.grid(True, alpha=0.3, linewidth=0.5)
 
-# ── Panel 5: |J| vs depth ────────────────────────────────────────────────────
-ax5 = fig.add_subplot(gs[1, 1])
-ax5.scatter(J_c, z_c * 100, s=6, alpha=0.5, color="darkorange", label="FEM nodes")
-ax5.axvline(J_analytic, color="r", ls="--", lw=2, label=f"Analytic: {J_analytic:.1f} A/m²")
-ax5.set_xlabel("|J| (A/m²)")
-ax5.set_ylabel("Depth z (cm)")
-ax5.set_title("|J| vs depth — center column\n(flat = uniform electrode)")
-ax5.legend(fontsize=8); ax5.grid(True, alpha=0.3)
+# ── [1,2] Validation metrics table ───────────────────────────────────────────
+ax = axes[1, 2]
+ax.axis("off")
 
-# ── Panel 6: Story panel — what changes in step02 ────────────────────────────
-ax6 = fig.add_subplot(gs[1, 2])
-ax6.axis("off")
+rows = [
+    ("Analytic |J|",     f"{J_an:.4f} A/m²",     "σ·ΔV/Lz",           "—"),
+    ("mean(|J|)",        f"{mean_J:.6f} A/m²",    "FEM volume avg",     "—"),
+    ("rel error",        f"{abs(mean_J-J_an)/J_an:.2e}", "vs analytic", "< 1e-3"),
+    ("CV std/mean(|J|)", f"{cv_J:.2e}",            "uniformity",        "< 1e-2"),
+    ("R²  V(z)",         f"{r2:.7f}",              "linearity",         "> 0.9999"),
+    ("slope  V(z)",      f"{coeffs[0]:.4f} V/m",  f"analytic {1/Lz:.4f}", "—"),
+    ("flux top |J_z|",   f"{flux_top:.4f} A/m²",  "conservation",      "—"),
+    ("flux bot |J_z|",   f"{flux_bot:.4f} A/m²",  "conservation",      "—"),
+    ("Φ range",          f"[{phi.min():.3f}, {phi.max():.3f}] V", "—", "—"),
+]
 
-# draw a schematic of finite electrode
-from matplotlib.patches import FancyArrowPatch, Rectangle
-# tissue box outline
-box_rect = plt.Rectangle((0.1, 0.05), 0.8, 0.55, fill=False,
-                          edgecolor="gray", linewidth=2)
-ax6.add_patch(box_rect)
-# finite electrode (small patch on top)
-elec = plt.Rectangle((0.35, 0.60), 0.12, 0.04, color="red", zorder=5)
-ax6.add_patch(elec)
-# return electrode
-ret = plt.Rectangle((0.62, 0.60), 0.12, 0.04, color="blue", zorder=5)
-ax6.add_patch(ret)
-# current concentration arrows under active electrode
-for xi in [0.37, 0.40, 0.43]:
-    ax6.annotate("", xy=(xi, 0.15), xytext=(xi, 0.58),
-                 arrowprops=dict(arrowstyle="->", color="darkorange",
-                                 lw=1.5))
-# wide arrows elsewhere (low J)
-for xi in [0.15, 0.75]:
-    ax6.annotate("", xy=(xi, 0.15), xytext=(xi, 0.58),
-                 arrowprops=dict(arrowstyle="->", color="wheat",
-                                 lw=0.8))
-ax6.text(0.5, 1.0,
-         "step02: finite bipolar electrodes\n"
-         "Key question: how does electrode size\n"
-         "change current density distribution?",
-         transform=ax6.transAxes, ha="center", va="top",
-         fontsize=9, fontweight="bold",
-         bbox=dict(facecolor="lightyellow", alpha=0.9, boxstyle="round"))
-ax6.text(0.41, 0.67, "+1V\n(active)", fontsize=7, ha="center", color="darkred")
-ax6.text(0.68, 0.67, "0V\n(return)", fontsize=7, ha="center", color="navy")
-ax6.text(0.40, 0.10, "HIGH J\nunder\nelectrode", fontsize=7,
-         ha="center", color="darkorange", fontweight="bold")
-ax6.text(0.15, 0.10, "low J", fontsize=7, ha="center", color="gray")
-ax6.set_xlim(0, 1); ax6.set_ylim(0, 1.05)
-ax6.set_title("What step02 models", fontsize=10)
+col_labels = ["Metric", "Value", "Note", "Tolerance"]
+col_widths = [0.28, 0.28, 0.26, 0.18]
+x_starts   = [0.0, 0.28, 0.56, 0.82]
 
-# ── Summary box ──────────────────────────────────────────────────────────────
-fig.text(0.01, 0.01,
-         f"step01 validation:  peak|J|={J_mag.max():.3f}  mean|J|={J_mag.mean():.3f}  "
-         f"analytic={J_analytic:.3f} A/m²  |  error={abs(J_mag.mean()-J_analytic)/J_analytic*100:.2f}%  |  "
-         f"R_eff={Lz/(0.2*Lx*Ly):.1f} Ω  |  Φ∈[{phi.min():.3f}, {phi.max():.3f}] V",
-         fontsize=8, color="dimgray")
+# Header
+for xi, lbl in zip(x_starts, col_labels):
+    ax.text(xi, 0.97, lbl, transform=ax.transAxes,
+            fontsize=8, fontweight="bold", va="top",
+            fontfamily="monospace")
+ax.plot([0, 1], [0.93, 0.93], color="gray", linewidth=0.8,
+        transform=ax.transAxes, clip_on=False)
 
+# Rows
+n = len(rows)
+for i, row in enumerate(rows):
+    y = 0.90 - i * (0.90 / n)
+    bg = "whitesmoke" if i % 2 == 0 else "white"
+    ax.add_patch(plt.Rectangle((0, y - 0.90/n/2), 1, 0.90/n,
+                               facecolor=bg, alpha=0.6,
+                               transform=ax.transAxes, clip_on=False))
+    for xi, cell in zip(x_starts, row):
+        ax.text(xi + 0.01, y, cell, transform=ax.transAxes,
+                fontsize=7.5, va="center", fontfamily="monospace")
+
+ax.set_title("Validation metrics", fontsize=10)
+ax.set_xlim(0, 1); ax.set_ylim(0, 1)
+
+# ── Save ─────────────────────────────────────────────────────────────────────
 out = Path("results/step01_summary.png")
-plt.savefig(out, dpi=150, bbox_inches="tight")
+fig.savefig(out, dpi=150, bbox_inches="tight")
 print(f"Saved → {out}")
-plt.close()
+print(f"Saved → {img3d}")
+plt.close(fig)
