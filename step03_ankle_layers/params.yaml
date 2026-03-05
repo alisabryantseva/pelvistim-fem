@@ -1,71 +1,89 @@
 # step03_ankle_layers/params.yaml
 # =============================================================================
-# ANKLE-LIKE LAYERED SLAB — tibial nerve stimulation model
+# ANKLE CROSS-SECTION MODEL — tibial nerve stimulation (PTNS-like)
 # =============================================================================
-# ALL CONDUCTIVITY AND THICKNESS VALUES ARE PLACEHOLDERS.
+# ALL THICKNESS AND CONDUCTIVITY VALUES ARE PLACEHOLDERS.
 # Replace with literature / measurement values before drawing conclusions.
-# See README.md § "How to plug in real parameters".
 #
-# Electrode model: DRY / REUSABLE electrodes (no added gel).
-# sigma_skin is an EFFECTIVE parameter capturing epidermis + contact impedance.
-# It should remain LOW (~0.001 S/m or below). See sigma_skin_sweep to explore
-# sensitivity. Recommend measuring contact impedance on your electrode/subject
-# combination and using that to calibrate sigma_skin.
+# Electrode placement:
+#   active  — medial groove (between tendon and medial malleolus)
+#   return  — posterior-lateral (behind lateral malleolus)
+#
+# Cross-section: approximate ankle polygon extruded to depth Lz.
+#   cross_section: "ankle"  — 12-point rounded polygon (default)
+#   cross_section: "rect"   — rectangular slab (backward-compatible)
 # =============================================================================
 
 geometry:
-  Lx: 0.12        # medial-lateral width (m)       ~12 cm
-  Ly: 0.09        # anterior-posterior depth (m)    ~9 cm
-  Lz: 0.040       # total slab depth (m)            ~4 cm
+  Lx: 0.080       # bounding box medial-lateral width  (m)  ~8 cm
+  Ly: 0.060       # bounding box anterior-posterior     (m)  ~6 cm
+  Lz: 0.040       # total slab depth                   (m)  ~4 cm
+  cross_section: "ankle"   # "ankle" or "rect"
 
 layers:
-  t_skin: 0.0015  # skin thickness (m)  ~1.5 mm  — PLACEHOLDER
-  t_fat:  0.005   # default fat thickness (m)  ~5 mm  — PLACEHOLDER
-                  # fat thickness sweep list (m); t_muscle = Lz - t_skin - t_fat
-  t_fat_sweep: [0.003, 0.005, 0.008]
+  t_skin: 0.0015           # skin thickness (m) ~1.5 mm — PLACEHOLDER
+  t_fat:  0.005            # default fat thickness (m) ~5 mm — PLACEHOLDER
+  t_fat_sweep: [0.003, 0.005, 0.008]  # fat thicknesses for full sweep
 
-# PLACEHOLDER conductivities — replace with measured / literature values.
-# sigma_skin represents the EFFECTIVE skin+contact impedance for DRY electrodes.
-# Keeping it low (<<  muscle) is physically appropriate for reusable electrodes.
+# PLACEHOLDER conductivities. Replace with literature/impedance-spectroscopy values.
 conductivities:
-  sigma_skin:    0.001    # S/m  effective dry-electrode value (PLACEHOLDER)
-  sigma_fat:     0.040    # S/m  literature range: ~0.01–0.06
-  sigma_muscle:  0.350    # S/m  literature range: ~0.1–0.5 (isotropic approx)
-
-  # Skin conductivity sweep — run with different values to assess sensitivity.
-  # Higher values = better gel contact; lower = dry / high-impedance.
+  sigma_skin:    0.001    # S/m  effective skin (background, no electrode contact)
+  sigma_fat:     0.040    # S/m  literature: ~0.01–0.06
+  sigma_muscle:  0.350    # S/m  isotropic approx; literature: ~0.1–0.5
   sigma_skin_sweep: [0.0002, 0.001, 0.005]
 
-electrodes:
-  shape:    circle          # "circle" or "square"
-  size_list: [0.005, 0.010, 0.015]   # radii (m): 5, 10, 15 mm
-  medial_offset:  0.025    # x-position of active electrode center (m from medial edge)
-  lateral_offset: 0.025    # distance from lateral edge to return center (m)
-  #   active  center: x = medial_offset
-  #   return  center: x = Lx - lateral_offset
+# ── Electrode-skin contact model ──────────────────────────────────────────────
+# model: "layer" — thin contact-material volume is added on top of the skin at
+#   each electrode position. Physically represents the electrode+hydrogel
+#   or dry-electrode contact interface.
+#   sigma_contact_Spm: effective conductivity of this layer (PLACEHOLDER).
+#     low (<0.01)  → dry/reusable electrode (high contact impedance)
+#     higher (0.05–0.2) → wet gel electrode
+# model: "none" — no contact layer; BCs applied directly on skin surface;
+#   sigma_skin acts as the sole contact-impedance proxy.
+contact:
+  enabled: true
+  model: "layer"
+  t_contact_mm: 0.5            # contact layer thickness (mm) — PLACEHOLDER
+  sigma_contact_Spm: 0.005     # effective contact conductivity (S/m) — PLACEHOLDER
+
+# ── Electrode placement and sweep ─────────────────────────────────────────────
+placement:
+  active_xy: [0.020, 0.030]    # m: medial groove  (x_medial, mid-y)
+  return_xy:  [0.068, 0.046]   # m: posterior-lateral (x_lateral, y_posterior)
+  electrode_shape: "circle"    # "circle" or "square"
+  electrode_r_mm_list: [5, 10, 15]   # electrode radii (m) for full sweep
 
 mesh:
-  lc_elec_factor: 0.30     # lc_elec = r * factor  (fine under electrode)
-  lc_bulk_cap:    0.010    # max element size in bulk (m)
-  lc_skin_min:    0.0005   # min element size (resolves thin skin layer) (m)
+  lc_global_mm:   3.0    # background element size (mm)
+  lc_electrode_mm: 1.5   # fine element size near electrode (mm)
+  lc_skin_min:    0.5    # minimum size (resolves thin skin/contact layers) (mm)
 
 roi:
-  z_target:   0.010   # depth below skin surface for tibial nerve ROI (m)  ~10 mm
-  roi_radius: 0.005   # ROI sphere radius (m)  ~5 mm  (auto-expands if too few cells)
+  z_target:   0.010   # m: tibial nerve depth below skin top (~10 mm)
+  roi_radius: 0.005   # m: ROI sphere radius (~5 mm); auto-expands if too few cells
+
+# ── Stimulation control ────────────────────────────────────────────────────────
+# control_mode: "current"  (recommended; matches TENS-like current-regulated devices)
+#   Active electrode: uniform current density Neumann BC such that ∫J·dA = I_mA.
+#   Return electrode: V = 0 (ground).
+#   Compliance: report max electrode potential difference; warn if > compliance_voltage_V.
+#
+# control_mode: "voltage"
+#   Active electrode: V = +1 V (Dirichlet).
+#   Return electrode: V = 0 V.
+#   Normalise outputs by total_current_A for cross-case comparison.
+stim:
+  control_mode:          "current"
+  injected_current_mA:   5.0
+  compliance_voltage_V:  100.0   # warn if V_active > this
 
 solver:
   tolerance:     1.0e-8
   linear_solver: UMFPACK
 
-# ── Stimulation control mode ──────────────────────────────────────────────────
-# "voltage": fixed potentials on electrodes (active=+1V, return=0V).
-#   Current depends on tissue/contact impedance. Good for comparing geometry;
-#   normalize outputs by total_current_A for cross-case comparison.
-#
-# "current": uniform current density Neumann BC on active electrode (return=0V).
-#   Approximates TENS-like current-regulated stimulators. Outputs directly
-#   comparable across cases. Compliance voltage is not constrained.
-#   Elmer BC: σ ∂φ/∂n = I/A  (outward normal at top face, A = electrode area).
-control:
-  control_mode:        voltage    # "voltage" or "current"
-  injected_current_mA: 5.0        # mA  — used only when control_mode = "current"
+# ── Plotting options ───────────────────────────────────────────────────────────
+plotting:
+  vmax_percentile: 99.95   # color scale ceiling (higher → less saturation)
+  log_norm:        true    # also save J_surface_maps_log.png
+  make_masked:     true    # also save J_surface_maps_masked.png (electrode footprints = NaN)

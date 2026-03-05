@@ -7,16 +7,21 @@ Usage (from step03_ankle_layers/):
     python3 plot_layered_results.py
 
 Outputs (in results/):
-    J_surface_maps.png   — |J| heatmaps on skin surface, grid by fat × radius
-                           Global color scale: vmin=0, vmax=99.5th percentile
-    summary_metrics.png  — Raw and normalised metrics vs electrode area
-    representative_3d.png — 3D pyvista render of one case
+    J_surface_maps.png        — |J| heatmaps, linear scale (vmax = vmax_percentile)
+    J_surface_maps_log.png    — same data, log color scale (shows low-J spreading)
+    J_surface_maps_masked.png — linear scale with electrode footprints set to NaN
+                                (emphasises current spreading away from electrodes)
+    summary_metrics.png       — Raw and normalised metrics vs electrode area
+    representative_3d.png     — 3D pyvista render of one case
+
+Plotting options are controlled via params.yaml  plotting:  section.
 """
 
 import json
 import yaml
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
 import matplotlib.tri as mtri
 import matplotlib.patches as mpatches
 import pyvista as pv
@@ -49,16 +54,23 @@ def load_vtu(t_fat_mm, elec_r_mm):
 
 # ── Plot 1: |J| surface heatmaps ─────────────────────────────────────────────
 def plot_J_surface_maps(summary, p):
+    plot_cfg  = p.get("plotting", {})
+    vmax_pct  = float(plot_cfg.get("vmax_percentile", 99.95))
+    do_log    = bool(plot_cfg.get("log_norm", True))
+    do_masked = bool(plot_cfg.get("make_masked", True))
+
     t_fats  = sorted(set(r["t_fat_mm"]  for r in summary))
     radii   = sorted(set(r["elec_r_mm"] for r in summary))
     nrows, ncols = len(t_fats), len(radii)
 
     g   = p["geometry"]
     Lx, Ly, Lz = g["Lx"], g["Ly"], g["Lz"]
-    ep  = p["electrodes"]
-    e1x = ep["medial_offset"]
-    e2x = Lx - ep["lateral_offset"]
-    ey  = Ly / 2
+    pl    = p.get("placement", p.get("electrodes", {}))
+    shape = pl.get("electrode_shape", pl.get("shape", "circle"))
+    e1x, e1y = pl.get("active_xy",
+                       [pl.get("medial_offset",  0.025), Ly / 2])
+    e2x, e2y = pl.get("return_xy",
+                       [Lx - pl.get("lateral_offset", 0.025), Ly / 2])
 
     # ── Collect all skin-surface J values for a GLOBAL color scale ────────────
     all_J  = []
@@ -69,7 +81,8 @@ def plot_J_surface_maps(summary, p):
             continue
         pts  = np.array(m.points)
         Jmag = np.linalg.norm(np.array(m.point_data["volume current"]), axis=1)
-        mask = pts[:, 2] > Lz * 0.99
+        # Skin surface is at z ≈ Lz regardless of contact layer (contact sits above it)
+        mask = (pts[:, 2] > Lz * 0.99) & (pts[:, 2] < Lz * 1.02)
         all_J.extend(Jmag[mask].tolist())
         meshes[(row["t_fat_mm"], row["elec_r_mm"])] = (pts, Jmag, mask)
 
@@ -77,98 +90,144 @@ def plot_J_surface_maps(summary, p):
         print("No VTU data found for surface maps.")
         return
 
-    # Global scale: vmin = 0, vmax = 99.5th percentile (avoid hot-spot saturation)
     vmin = 0.0
-    vmax = float(np.percentile(all_J, 99.5))
+    vmax = float(np.percentile(all_J, vmax_pct))
     if vmax <= 0:
         vmax = float(np.max(all_J))
 
-    # Get sigma_skin from summary (same for all rows in a single run)
     sig_skin = summary[0].get("sigma_skin", p["conductivities"]["sigma_skin"])
 
-    fig, axes = plt.subplots(
-        nrows, ncols,
-        figsize=(4.5 * ncols, 4 * nrows),
-        constrained_layout=True
-    )
-    if nrows == 1 and ncols == 1:
-        axes = np.array([[axes]])
-    elif nrows == 1:
-        axes = axes[np.newaxis, :]
-    elif ncols == 1:
-        axes = axes[:, np.newaxis]
+    def _render_figure(norm, levels, out_name, title_suffix, mask_fn=None):
+        """Build and save one J-surface heatmap figure."""
+        fig, axes = plt.subplots(
+            nrows, ncols,
+            figsize=(4.5 * ncols, 4 * nrows),
+            constrained_layout=True
+        )
+        if nrows == 1 and ncols == 1:
+            axes = np.array([[axes]])
+        elif nrows == 1:
+            axes = axes[np.newaxis, :]
+        elif ncols == 1:
+            axes = axes[:, np.newaxis]
 
-    fig.suptitle(
-        "|J| at skin surface (z = Lz)  —  ankle layered model\n"
-        f"σ_skin={sig_skin} S/m  fat={p['conductivities']['sigma_fat']} S/m  "
-        f"muscle={p['conductivities']['sigma_muscle']} S/m  [PLACEHOLDER values]\n"
-        f"Color scale: 0 – {vmax:.4f} A/m²  (global 99.5th percentile max)",
-        fontsize=9, fontweight="bold"
-    )
+        fig.suptitle(
+            f"|J| at skin surface (z = Lz)  —  ankle layered model  {title_suffix}\n"
+            f"σ_skin={sig_skin} S/m  fat={p['conductivities']['sigma_fat']} S/m  "
+            f"muscle={p['conductivities']['sigma_muscle']} S/m  [PLACEHOLDER values]\n"
+            f"Color scale: {vmin:.2g} – {vmax:.4f} A/m²  "
+            f"({vmax_pct:.2f}th percentile max)",
+            fontsize=9, fontweight="bold"
+        )
 
-    shape = ep["shape"]
-    for ri, tfat in enumerate(t_fats):
-        for ci, r_mm in enumerate(radii):
-            ax  = axes[ri][ci]
-            key = (tfat, r_mm)
-            row = next((x for x in summary
-                        if x["t_fat_mm"] == tfat and x["elec_r_mm"] == r_mm), None)
+        for ri, tfat in enumerate(t_fats):
+            for ci, r_mm in enumerate(radii):
+                ax  = axes[ri][ci]
+                key = (tfat, r_mm)
+                row = next((x for x in summary
+                            if x["t_fat_mm"] == tfat and x["elec_r_mm"] == r_mm), None)
 
-            if key not in meshes or row is None:
-                ax.text(0.5, 0.5, "no data", transform=ax.transAxes,
-                        ha="center", va="center")
-                ax.axis("off")
-                continue
+                if key not in meshes or row is None:
+                    ax.text(0.5, 0.5, "no data", transform=ax.transAxes,
+                            ha="center", va="center")
+                    ax.axis("off")
+                    continue
 
-            pts, Jmag, mask = meshes[key]
-            xp, yp = pts[mask, 0], pts[mask, 1]
+                pts, Jmag, smask = meshes[key]
+                xp     = pts[smask, 0]
+                yp     = pts[smask, 1]
+                Jvals  = Jmag[smask].copy()
 
-            try:
-                tri = mtri.Triangulation(xp, yp)
-                tc  = ax.tricontourf(tri, Jmag[mask], levels=30, cmap="inferno",
-                                     vmin=vmin, vmax=vmax)
-            except Exception:
-                tc = ax.scatter(xp, yp, c=Jmag[mask], cmap="inferno",
-                                vmin=vmin, vmax=vmax, s=4)
+                if mask_fn is not None:
+                    r_m   = r_mm / 1000.0
+                    Jvals = mask_fn(Jvals, xp, yp, r_m)
 
-            r_m = r_mm / 1000.0
-            if shape == "circle":
-                for xc, lbl, clr in [(e1x, "+V/+I", "cyan"), (e2x, "0V", "lime")]:
-                    ax.add_patch(plt.Circle((xc, ey), r_m, fill=False,
-                                            edgecolor=clr, lw=1.8, ls="--"))
-                    ax.text(xc, ey, lbl, ha="center", va="center",
+                # For log norm exclude zero/negative; for masked exclude NaN
+                valid = np.isfinite(Jvals)
+                if isinstance(norm, mcolors.LogNorm):
+                    valid = valid & (Jvals > 0)
+
+                if valid.sum() < 3:
+                    ax.text(0.5, 0.5, "no valid data", transform=ax.transAxes,
+                            ha="center", va="center")
+                else:
+                    try:
+                        tri = mtri.Triangulation(xp[valid], yp[valid])
+                        ax.tricontourf(tri, Jvals[valid], levels=levels,
+                                       cmap="inferno", norm=norm)
+                    except Exception:
+                        ax.scatter(xp[valid], yp[valid], c=Jvals[valid],
+                                   cmap="inferno", norm=norm, s=4)
+
+                r_m = r_mm / 1000.0
+                for (xc, yc), lbl, clr in [
+                        ((e1x, e1y), "+I", "cyan"),
+                        ((e2x, e2y), "0V", "lime")]:
+                    if shape == "circle":
+                        ax.add_patch(plt.Circle((xc, yc), r_m, fill=False,
+                                                edgecolor=clr, lw=1.8, ls="--"))
+                    else:
+                        ax.add_patch(mpatches.Rectangle(
+                            (xc - r_m, yc - r_m), 2*r_m, 2*r_m,
+                            fill=False, edgecolor=clr, lw=1.8, ls="--"))
+                    ax.text(xc, yc, lbl, ha="center", va="center",
                             color=clr, fontsize=7, fontweight="bold")
-            else:
-                for xc, lbl, clr in [(e1x, "+V/+I", "cyan"), (e2x, "0V", "lime")]:
-                    ax.add_patch(mpatches.Rectangle(
-                        (xc - r_m, ey - r_m), 2*r_m, 2*r_m,
-                        fill=False, edgecolor=clr, lw=1.8, ls="--"))
-                    ax.text(xc, ey, lbl, ha="center", va="center",
-                            color=clr, fontsize=7, fontweight="bold")
 
-            ax.set_xlim(0, Lx); ax.set_ylim(0, Ly)
-            ax.set_aspect("equal")
-            ax.set_xlabel("x (m)"); ax.set_ylabel("y (m)")
+                ax.set_xlim(0, Lx); ax.set_ylim(0, Ly)
+                ax.set_aspect("equal")
+                ax.set_xlabel("x (m)"); ax.set_ylabel("y (m)")
 
-            # Title includes fat thickness, electrode size, sigma_skin
-            ax.set_title(
-                f"fat={tfat:.0f} mm  |  r={r_mm:.0f} mm\n"
-                f"σ_skin={row.get('sigma_skin', sig_skin)}\n"
-                f"peak|J|={row['peak_J_skin']:.4f}  "
-                f"ROI|J|={row['mean_J_roi']:.4f} A/m²",
-                fontsize=7.5
-            )
+                pk  = row.get("peak_J_skin_no_elec",
+                              row.get("peak_J_skin", float("nan")))
+                rj  = row.get("roi_mean_J", row.get("mean_J_roi", float("nan")))
+                ax.set_title(
+                    f"fat={tfat:.0f} mm  |  r={r_mm:.0f} mm\n"
+                    f"σ_skin={row.get('sigma_skin', sig_skin)}\n"
+                    f"peak|J|(no-elec)={pk:.4f}  ROI|J|={rj:.4f} A/m²",
+                    fontsize=7.5
+                )
 
-    # Single shared colorbar — fixed range 0 → vmax
-    sm = plt.cm.ScalarMappable(cmap="inferno",
-                               norm=plt.Normalize(vmin=vmin, vmax=vmax))
-    sm.set_array([])
-    fig.colorbar(sm, ax=axes, label="|J| (A/m²)", shrink=0.6, pad=0.01)
+        sm = plt.cm.ScalarMappable(cmap="inferno", norm=norm)
+        sm.set_array([])
+        fig.colorbar(sm, ax=axes, label="|J| (A/m²)", shrink=0.6, pad=0.01)
 
-    out = RESULTS_DIR / "J_surface_maps.png"
-    fig.savefig(out, dpi=140, bbox_inches="tight")
-    print(f"Saved → {out}")
-    plt.close(fig)
+        out = RESULTS_DIR / out_name
+        fig.savefig(out, dpi=140, bbox_inches="tight")
+        print(f"Saved → {out}")
+        plt.close(fig)
+
+    # ── Linear plot ───────────────────────────────────────────────────────────
+    lin_norm   = mcolors.Normalize(vmin=vmin, vmax=vmax)
+    lin_levels = np.linspace(vmin, vmax, 31)
+    _render_figure(lin_norm, lin_levels, "J_surface_maps.png",
+                   f"(linear, {vmax_pct:.2f}th pct max)")
+
+    # ── Log-scale plot ────────────────────────────────────────────────────────
+    if do_log:
+        pos_J      = [j for j in all_J if j > 0]
+        log_vmin   = max(1e-6, float(np.percentile(pos_J, 1))) if pos_J else 1e-6
+        log_norm   = mcolors.LogNorm(vmin=log_vmin, vmax=vmax)
+        log_levels = np.logspace(np.log10(log_vmin), np.log10(vmax), 30)
+        _render_figure(log_norm, log_levels, "J_surface_maps_log.png",
+                       "(log scale)")
+
+    # ── Masked-electrode plot ─────────────────────────────────────────────────
+    if do_masked:
+        def _mask_electrodes(Jvals, xp, yp, r_m):
+            Jout = Jvals.copy().astype(float)
+            for ex, ey in [(e1x, e1y), (e2x, e2y)]:
+                if shape == "circle":
+                    inside = np.sqrt((xp - ex)**2 + (yp - ey)**2) < r_m
+                else:
+                    inside = (np.abs(xp - ex) < r_m) & (np.abs(yp - ey) < r_m)
+                Jout[inside] = np.nan
+            return Jout
+
+        msk_norm   = mcolors.Normalize(vmin=vmin, vmax=vmax)
+        msk_levels = np.linspace(vmin, vmax, 31)
+        _render_figure(msk_norm, msk_levels, "J_surface_maps_masked.png",
+                       "(electrode footprint masked)",
+                       mask_fn=_mask_electrodes)
 
 
 # ── Plot 2: raw + normalised summary metrics ──────────────────────────────────
@@ -179,79 +238,91 @@ def plot_summary_metrics(summary, p):
     sig_skin = summary[0].get("sigma_skin", p["conductivities"]["sigma_skin"])
     mode     = summary[0].get("control_mode", "voltage")
 
-    fig, axes = plt.subplots(2, 3, figsize=(15, 9), constrained_layout=True)
-    fig.suptitle(
-        f"Electrode size effects — ankle layered model  "
-        f"[σ_skin={sig_skin} S/m, mode={mode}]  PLACEHOLDER conductivities\n"
-        "Each curve = one fat thickness.  Top row: raw values.  "
-        "Bottom row: normalised by total injected current.",
-        fontsize=10, fontweight="bold"
-    )
-
     roi_r_mm = p["roi"]["roi_radius"] * 1000
     z_tgt_mm = p["roi"]["z_target"] * 1000
 
-    # ── Row 0: raw metrics ────────────────────────────────────────────────────
+    # ── Panel definitions ─────────────────────────────────────────────────────
+    # Row 0: raw metrics
     raw_panels = [
-        ("Skin peak |J|  (comfort proxy)\n"
+        ("Skin peak |J| (no-electrode, comfort proxy)\n"
          "Smaller electrode → higher peak → more discomfort risk",
-         "peak_J_skin", "Peak |J| at skin (A/m²)"),
-        (f"ROI mean |J|  (efficacy proxy)\n"
-         f"Sphere r={roi_r_mm:.0f}mm at {z_tgt_mm:.0f}mm depth under active electrode",
-         "mean_J_roi",  "Mean |J| in ROI (A/m²)"),
-        ("Tradeoff: ROI |J| / skin peak |J|\n"
-         "Higher = more efficient stimulation per unit skin exposure",
-         "tradeoff",    "Tradeoff ratio (dimensionless)"),
+         "peak_J_skin_no_elec",
+         "Peak |J| outside electrode (A/m²)"),
+        (f"ROI mean |E|  (efficacy proxy)\n"
+         f"Sphere r={roi_r_mm:.0f}mm at {z_tgt_mm:.0f}mm depth",
+         "roi_mean_E",
+         "Mean |E| in ROI (V/m)"),
+        ("Efficiency = ROI |E| / skin peak |J|\n"
+         "Higher = more deep field per unit skin exposure  [m]",
+         "efficiency",
+         "Efficiency  (V/m) / (A/m²) = m"),
+    ]
+    # Row 1: normalised + compliance
+    norm_panels = [
+        ("Skin peak |J| / I_injected\n"
+         "Comparable across voltage & current modes",
+         "peak_J_skin_per_A",
+         "Peak |J|(no-elec) / I  (1/m²)"),
+        ("ROI mean |E| / I_injected\n"
+         "Transfer function: deep E-field per unit injected current",
+         "roi_mean_E_per_A",
+         "ROI mean |E| / I  (V/m/A)"),
+        ("Required electrode voltage  [current mode]\n"
+         "Compliance limit exceeded → flag; voltage mode: fixed 1V",
+         "compliance_V",
+         "V_active  (V)"),
     ]
 
-    # ── Row 1: current-normalised metrics ─────────────────────────────────────
-    norm_panels = [
-        ("Normalised skin peak |J| / I_injected\n"
-         "Comparable across voltage & current modes",
-         "peak_J_skin_per_A", "Peak |J| / I  (A/m² per A = 1/m²)"),
-        ("Normalised ROI mean |J| / I_injected\n"
-         "Transfer function: deep J per unit injected current",
-         "roi_mean_J_per_A",  "ROI mean |J| / I  (1/m²)"),
-        ("Total injected current  (voltage mode)\n"
-         "Lower = higher impedance.  Should match return current within flux_err.",
-         "total_current_A",   "I_injected  (A)"),
-    ]
+    fig, axes = plt.subplots(2, 3, figsize=(15, 9), constrained_layout=True)
+    fig.suptitle(
+        f"Electrode size effects — ankle cross-section model  "
+        f"[σ_skin={sig_skin} S/m, mode={mode}]  PLACEHOLDER conductivities\n"
+        "Each curve = one fat thickness.  "
+        "Row 0: raw.  Row 1: normalised by I_injected + compliance.",
+        fontsize=10, fontweight="bold"
+    )
+
+    compliance_lim = p.get("stim", p.get("control", {})
+                          ).get("compliance_voltage_V", 100.0)
+
+    def _draw_panel(ax, key, ylabel, title):
+        for tfat, clr in zip(t_fats, colors):
+            sub = sorted(
+                [r for r in summary if r["t_fat_mm"] == tfat],
+                key=lambda x: x["elec_area_cm2"])
+            if not sub:
+                continue
+            areas, vals, rmms = [], [], []
+            for r in sub:
+                v = r.get(key)
+                if v is None or (isinstance(v, float) and np.isnan(v)):
+                    continue
+                areas.append(r["elec_area_cm2"])
+                vals.append(v)
+                rmms.append(r["elec_r_mm"])
+            if not areas:
+                continue
+            ax.plot(areas, vals, "o-", color=clr, lw=2, ms=7,
+                    label=f"fat={tfat:.0f} mm")
+            for a, v, rmm in zip(areas, vals, rmms):
+                ax.annotate(f"r={rmm:.0f}", (a, v),
+                            textcoords="offset points", xytext=(5, 3),
+                            fontsize=7, color=clr)
+
+        if key == "compliance_V" and mode == "current":
+            ax.axhline(compliance_lim, color="red", lw=1.2, ls="--",
+                       label=f"compliance limit ({compliance_lim:.0f} V)")
+
+        ax.set_xlabel("Electrode area (cm²)", fontsize=9)
+        ax.set_ylabel(ylabel, fontsize=9)
+        ax.set_title(title, fontsize=8.5)
+        ax.set_xscale("log")
+        ax.grid(True, alpha=0.3, linewidth=0.5)
+        ax.legend(fontsize=8, framealpha=0.85)
 
     for row_idx, panels in enumerate([raw_panels, norm_panels]):
         for col_idx, (title, key, ylabel) in enumerate(panels):
-            ax = axes[row_idx][col_idx]
-            for tfat, clr in zip(t_fats, colors):
-                sub = sorted(
-                    [r for r in summary if r["t_fat_mm"] == tfat],
-                    key=lambda x: x["elec_area_cm2"])
-                if not sub:
-                    continue
-
-                areas, vals, rmms = [], [], []
-                for r in sub:
-                    v = r.get(key)
-                    if v is None or (isinstance(v, float) and np.isnan(v)):
-                        continue
-                    areas.append(r["elec_area_cm2"])
-                    vals.append(v)
-                    rmms.append(r["elec_r_mm"])
-
-                if not areas:
-                    continue
-
-                ax.plot(areas, vals, "o-", color=clr, lw=2, ms=7,
-                        label=f"fat={tfat:.0f} mm")
-                for a, v, rmm in zip(areas, vals, rmms):
-                    ax.annotate(f"r={rmm:.0f}", (a, v),
-                                textcoords="offset points", xytext=(5, 3),
-                                fontsize=7, color=clr)
-
-            ax.set_xlabel("Electrode area (cm²)", fontsize=9)
-            ax.set_ylabel(ylabel, fontsize=9)
-            ax.set_title(title, fontsize=8.5)
-            ax.set_xscale("log")
-            ax.grid(True, alpha=0.3, linewidth=0.5)
-            ax.legend(fontsize=8, framealpha=0.85)
+            _draw_panel(axes[row_idx][col_idx], key, ylabel, title)
 
     out = RESULTS_DIR / "summary_metrics.png"
     fig.savefig(out, dpi=150, bbox_inches="tight")

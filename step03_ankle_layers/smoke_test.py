@@ -58,11 +58,13 @@ def run_smoke_case():
 
 def find_smoke_vtu(p):
     """Locate the VTU produced by the smoke case (middle fat, middle electrode)."""
-    t_fat   = p["layers"]["t_fat"]
-    elec_r  = p["electrodes"]["size_list"][1]
-    label   = f"tfat{int(t_fat*1000):04d}um_r{int(elec_r*1000):04d}um"
-    vtu     = RESULTS_DIR / label / "results" / "case_t0001.vtu"
-    return vtu, label, t_fat, elec_r
+    t_fat    = p["layers"]["t_fat"]
+    pl       = p.get("placement", p.get("electrodes", {}))
+    r_list   = pl.get("electrode_r_mm_list", pl.get("size_list", [5, 10, 15]))
+    elec_r_mm = r_list[len(r_list) // 2]   # middle size (in mm)
+    label    = f"tfat{int(t_fat*1000):04d}um_r{int(elec_r_mm):04d}um"
+    vtu      = RESULTS_DIR / label / "results" / "case_t0001.vtu"
+    return vtu, label, t_fat, elec_r_mm
 
 
 def main():
@@ -87,16 +89,26 @@ def main():
     pts  = np.array(mesh.points)
 
     # ── 2. Potential field ────────────────────────────────────────────────────
-    has_phi = "potential" in mesh.point_data
-    passed.append(check("Field 'potential' present", has_phi))
+    phi_key = next((k for k in ("potential", "Potential")
+                    if k in mesh.point_data), None)
+    has_phi = phi_key is not None
+    passed.append(check("Potential field present", has_phi,
+                        f"key='{phi_key}'"))
     if has_phi:
-        phi    = np.array(mesh.point_data["potential"])
+        phi    = np.array(mesh.point_data[phi_key])
         finite = np.all(np.isfinite(phi))
         passed.append(check("Potential is finite (no NaN/Inf)", finite,
                             f"min={phi.min():.4f} max={phi.max():.4f} V"))
-        in_range = (phi.min() >= -0.01) and (phi.max() <= 1.01)
-        passed.append(check("Potential in [0, 1] V",   in_range,
-                            f"min={phi.min():.4f} max={phi.max():.4f}"))
+        # In current mode potential can be >> 1V; just check it's non-negative
+        mode_cfg = p.get("stim", p.get("control", {})).get("control_mode", "voltage")
+        if mode_cfg == "voltage":
+            in_range = (phi.min() >= -0.01) and (phi.max() <= 1.01)
+            passed.append(check("Potential in [0, 1] V (voltage mode)", in_range,
+                                f"min={phi.min():.4f} max={phi.max():.4f}"))
+        else:
+            in_range = phi.min() >= -0.01
+            passed.append(check("Potential ≥ 0 V (current mode)", in_range,
+                                f"min={phi.min():.4f} max={phi.max():.4f}"))
 
     # ── 3. Current density field ──────────────────────────────────────────────
     has_J = "volume current" in mesh.point_data
@@ -109,13 +121,10 @@ def main():
                             f"max|J|={Jmag.max():.3f} A/m²"))
 
     # ── 4. Electric field computable from potential ───────────────────────────
-    # Elmer StatCurrentSolve doesn't export E directly; we compute E = -∇φ
-    # using pyvista's compute_derivative. Check it runs without error here.
-    has_phi_check = "potential" in mesh.point_data
-    if has_phi_check:
+    if has_phi:
         try:
             mc = mesh.point_data_to_cell_data()
-            gm = mc.compute_derivative(scalars="potential")
+            gm = mc.compute_derivative(scalars=phi_key)
             E_cells = -np.array(gm.cell_data["gradient"])
             Emag_ok = np.all(np.isfinite(E_cells))
         except Exception as exc:
@@ -132,7 +141,7 @@ def main():
             results = json.load(f)
         row = next((r for r in results
                     if abs(r["t_fat_mm"] - t_fat*1000) < 0.1
-                    and abs(r["elec_r_mm"] - elec_r*1000) < 0.1), None)
+                    and abs(r["elec_r_mm"] - elec_r_mm) < 0.1), None)
 
         if row is not None:
             # ── 5a. Current conservation ──────────────────────────────────────
@@ -154,15 +163,27 @@ def main():
             ))
 
             # ── 5c. ROI mean |J| — cell-based, never NaN ──────────────────────
-            roi_J = row.get("mean_J_roi", float("nan"))
+            roi_J = row.get("roi_mean_J", row.get("mean_J_roi", float("nan")))
             roi_n = row.get("roi_n_cells", 0)
             roi_r = row.get("roi_radius_used_mm", "?")
             ok_roi = np.isfinite(roi_J) and roi_J > ROI_MIN
             passed.append(check(
                 "ROI mean |J| is positive and finite",
                 ok_roi,
-                f"mean_J_roi={roi_J:.5f} A/m²  roi_n_cells={roi_n}  r_used={roi_r}mm"
+                f"roi_mean_J={roi_J:.5f} A/m²  roi_n_cells={roi_n}  r_used={roi_r}mm"
             ))
+            # ── 5d. Compliance voltage (current mode) ──────────────────────────
+            mode_cfg = p.get("stim", p.get("control", {})
+                             ).get("control_mode", "voltage")
+            if mode_cfg == "current":
+                cV  = row.get("compliance_V", float("nan"))
+                lim = p.get("stim", {}).get("compliance_voltage_V", 100.0)
+                ok_cV = np.isfinite(cV) and cV > 0
+                passed.append(check(
+                    "compliance_V is positive and finite",
+                    ok_cV,
+                    f"compliance_V={cV:.2f} V  (limit={lim:.0f} V)"
+                ))
         else:
             print("  [SKIP]  Could not find matching row in summary.json")
 
