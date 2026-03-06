@@ -26,11 +26,49 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import matplotlib.tri as mtri
 import matplotlib.patches as mpatches
+from matplotlib.path import Path as MplPath
+from matplotlib.patches import PathPatch
 import pyvista as pv
 from pathlib import Path
 
 RESULTS_DIR = Path(__file__).parent / "results"
 PARAMS_FILE = Path(__file__).parent / "params.yaml"
+
+
+# ── Ankle outline (mirrors run_layered_sweep.py) ──────────────────────────────
+def ankle_outline_pts(Lx, Ly):
+    """
+    12-point ankle cross-section polygon (same as run_layered_sweep.py).
+    x = medial (0) → lateral (Lx).   y = anterior (0) → posterior (Ly).
+    P7 (0.50, 1.00) = posterior center ≈ Achilles tendon.
+    P10 (0.02, 0.47) = medial groove  ← active electrode.
+    P5  (0.93, 0.72) = posterior-lateral ← return electrode region.
+    """
+    frac = [
+        (0.25, 0.02),   # P0  anterior-medial
+        (0.50, 0.00),   # P1  anterior center
+        (0.75, 0.02),   # P2  anterior-lateral
+        (0.97, 0.22),   # P3  lateral-anterior
+        (1.00, 0.47),   # P4  lateral-mid
+        (0.93, 0.72),   # P5  posterior-lateral
+        (0.75, 0.97),   # P6  posterior-lateral end
+        (0.50, 1.00),   # P7  posterior center  ← Achilles tendon
+        (0.25, 0.97),   # P8  posterior-medial end
+        (0.07, 0.72),   # P9  medial-posterior
+        (0.02, 0.47),   # P10 medial groove
+        (0.07, 0.22),   # P11 medial-anterior
+    ]
+    return [(fx * Lx, fy * Ly) for fx, fy in frac]
+
+
+def _ankle_mpl_path(Lx, Ly):
+    """Return a closed matplotlib Path tracing the ankle polygon."""
+    pts = ankle_outline_pts(Lx, Ly)
+    pts_c = pts + [pts[0]]
+    codes = ([MplPath.MOVETO]
+             + [MplPath.LINETO] * (len(pts) - 1)
+             + [MplPath.CLOSEPOLY])
+    return MplPath(pts_c, codes)
 
 
 def load_params():
@@ -65,8 +103,9 @@ def plot_J_surface_maps(summary, p):
     radii   = sorted(set(r["elec_r_mm"] for r in summary))
     nrows, ncols = len(t_fats), len(radii)
 
-    g   = p["geometry"]
+    g     = p["geometry"]
     Lx, Ly, Lz = g["Lx"], g["Ly"], g["Lz"]
+    cross = g.get("cross_section", "rect")
     pl    = p.get("placement", p.get("electrodes", {}))
     shape = pl.get("electrode_shape", pl.get("shape", "circle"))
     e1x, e1y = pl.get("active_xy",
@@ -156,35 +195,71 @@ def plot_J_surface_maps(summary, p):
                 if isinstance(norm, mcolors.LogNorm):
                     valid = valid & (Jvals > 1e-12)
 
+                # ── Build ankle clip path (for masking triangles + electrode outlines) ─
+                a_path = _ankle_mpl_path(Lx, Ly) if cross == "ankle" else None
+
                 if valid.sum() < 3:
                     ax.text(0.5, 0.5, "no valid data", transform=ax.transAxes,
                             ha="center", va="center", color="white")
                 else:
                     try:
                         tri = mtri.Triangulation(xp[valid], yp[valid])
+                        # Mask triangles whose centroid falls outside the ankle polygon
+                        if a_path is not None:
+                            cx_ = xp[valid][tri.triangles].mean(axis=1)
+                            cy_ = yp[valid][tri.triangles].mean(axis=1)
+                            outside = ~a_path.contains_points(
+                                np.column_stack([cx_, cy_]))
+                            tri.set_mask(outside)
                         ax.tricontourf(tri, Jvals[valid], levels=levels,
                                        cmap=_cmap, norm=norm, extend="both")
                     except Exception:
                         ax.scatter(xp[valid], yp[valid], c=Jvals[valid],
                                    cmap=_cmap, norm=norm, s=4)
 
+                # ── Draw ankle outline ──────────────────────────────────────────────
+                if a_path is not None:
+                    apt = ankle_outline_pts(Lx, Ly)
+                    xs_ = [q[0] for q in apt] + [apt[0][0]]
+                    ys_ = [q[1] for q in apt] + [apt[0][1]]
+                    ax.plot(xs_, ys_, color="white", lw=0.9, alpha=0.55, zorder=3)
+
+                # ── Electrode outlines — clipped to ankle boundary ──────────────────
                 r_m = r_mm / 1000.0
+                # Build clip patch from ankle polygon (clips patches that extend outside)
+                clip_patch = (PathPatch(a_path, transform=ax.transData)
+                              if a_path is not None else None)
+
                 for (xc, yc), lbl, clr in [
                         ((e1x, e1y), "+I", "cyan"),
                         ((e2x, e2y), "0V", "lime")]:
                     if shape == "circle":
-                        ax.add_patch(plt.Circle((xc, yc), r_m, fill=False,
-                                                edgecolor=clr, lw=1.8, ls="--"))
+                        patch = plt.Circle((xc, yc), r_m, fill=False,
+                                           edgecolor=clr, lw=1.8, ls="--", zorder=4)
                     else:
-                        ax.add_patch(mpatches.Rectangle(
+                        patch = mpatches.Rectangle(
                             (xc - r_m, yc - r_m), 2*r_m, 2*r_m,
-                            fill=False, edgecolor=clr, lw=1.8, ls="--"))
+                            fill=False, edgecolor=clr, lw=1.8, ls="--", zorder=4)
+                    ax.add_patch(patch)
+                    if clip_patch is not None:
+                        patch.set_clip_path(clip_patch)
                     ax.text(xc, yc, lbl, ha="center", va="center",
-                            color=clr, fontsize=7, fontweight="bold")
+                            color=clr, fontsize=7, fontweight="bold", zorder=5)
+
+                # ── Achilles tendon landmark ────────────────────────────────────────
+                # P7 (0.50, 1.00) = posterior center = Achilles tendon
+                at_x = Lx * 0.50
+                at_y = Ly * 0.96   # just inside posterior boundary
+                ax.plot(at_x, at_y, '^', color='white', ms=5,
+                        mfc='white', mew=1.0, zorder=5)
+                ax.text(at_x, at_y - Ly * 0.05, 'AT', ha='center', va='top',
+                        color='white', fontsize=5, fontweight='bold', zorder=5)
 
                 ax.set_xlim(0, Lx); ax.set_ylim(0, Ly)
                 ax.set_aspect("equal")
-                ax.set_xlabel("x (m)"); ax.set_ylabel("y (m)")
+                # Anatomical direction labels
+                ax.set_xlabel("Medial → Lateral  (m)", fontsize=7)
+                ax.set_ylabel("Anterior → Posterior  (m)", fontsize=7)
 
                 pk  = row.get("peak_J_skin_no_elec",
                               row.get("peak_J_skin", float("nan")))
