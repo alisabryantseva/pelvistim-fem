@@ -26,8 +26,11 @@ Summary metrics:
   roi_mean_J             — mean |J| in ROI sphere  [A/m²]
   efficiency             — roi_mean_E / peak_J_skin_no_elec  [m]
   total_current_A        — surface integral of J·n over active electrode
-  compliance_V           — max V at active electrode minus V_return  (current mode)
-  flux_err               — |I_active - I_return| / max(...)
+  jn_used                — current density applied at active electrode (current mode, A/m²)
+  compliance_V           — mean(V_active) − mean(V_return)  (current mode)
+  exceeded_compliance    — True if compliance_V > compliance_voltage_V limit
+  I_return_A             — surface-integral |J| at return electrode
+  flux_err               — |I_active + I_return| / max(|I_active|,|I_return|)  (signed KCL)
 """
 
 import sys
@@ -491,12 +494,14 @@ End
     shape = body_info.get("elec_shape",
                           pl.get("electrode_shape", pl.get("shape", "circle")))
 
+    jn_used = None
     if mode == "voltage":
         bc1_active = "  Potential = 1.0"
     else:  # current
         I_A  = st.get("injected_current_mA", 5.0) * 1e-3
         area = np.pi * elec_r**2 if shape == "circle" else (2 * elec_r)**2
         jn   = I_A / area
+        jn_used = jn
         bc1_active = (f"  Current Density = {jn:.6e}  "
                       f"! I={I_A*1e3:.1f}mA, A={area*1e4:.3f}cm²")
 
@@ -520,6 +525,7 @@ End
            + bodies + materials + bcs)
 
     (run_dir / "case.sif").write_text(sif)
+    return jn_used
 
 
 # ── 4. Run shell commands ──────────────────────────────────────────────────────
@@ -573,10 +579,14 @@ def compute_injected_current(mesh, e1_pos3d, e2_pos3d, elec_r, z_elec_top,
     if not active_mask.any() or not return_mask.any():
         return np.nan, np.nan, np.nan
 
-    I_active = float(abs(np.sum(J_cells[active_mask, 2] * areas[active_mask])))
-    I_return = float(abs(np.sum(J_cells[return_mask, 2] * areas[return_mask])))
+    # Signed integrals: inward at active → negative; outward at return → positive
+    I_active_signed = float(np.sum(J_cells[active_mask, 2] * areas[active_mask]))
+    I_return_signed = float(np.sum(J_cells[return_mask, 2] * areas[return_mask]))
+    I_active = abs(I_active_signed)
+    I_return = abs(I_return_signed)
     denom    = max(I_active, I_return)
-    flux_err = float(abs(I_active - I_return) / denom) if denom > 0 else np.nan
+    # KCL: signed sum should be near 0 if current is conserved
+    flux_err = float(abs(I_active_signed + I_return_signed) / denom) if denom > 0 else np.nan
 
     return I_active, I_return, flux_err
 
@@ -644,7 +654,7 @@ def eval_roi(mesh, roi_cen, roi_radius_init, min_cells=4):
 
 # ── 5c. Extract all metrics from VTU ──────────────────────────────────────────
 def extract_results(run_dir, p, t_fat, elec_r, e1_pos3d, e2_pos3d,
-                    body_info, sigma_skin_used=None):
+                    body_info, sigma_skin_used=None, jn_used=None):
     vtu_path = run_dir / "results" / "case_t0001.vtu"
     if not vtu_path.exists():
         raise FileNotFoundError(f"VTU not found: {vtu_path}")
@@ -696,28 +706,39 @@ def extract_results(run_dir, p, t_fat, elec_r, e1_pos3d, e2_pos3d,
     st   = _stim(p)
     mode = st.get("control_mode", "voltage")
     compliance_V = np.nan
+    exceeded_compliance = False
     if mode == "current":
-        # Active electrode nodes: top face near e1 position
-        tol_z_e   = max(z_elec_top * 5e-3, 1e-5)
-        elec_mask = pts[:, 2] > z_elec_top - tol_z_e
-        if elec_shape == "circle":
-            elec_mask &= (np.sqrt((pts[:, 0] - e1_pos3d[0])**2
-                                  + (pts[:, 1] - e1_pos3d[1])**2) < elec_r * 1.5)
-        else:
-            elec_mask &= ((np.abs(pts[:, 0] - e1_pos3d[0]) < elec_r * 1.5)
-                          & (np.abs(pts[:, 1] - e1_pos3d[1]) < elec_r * 1.5))
-        if elec_mask.any() and "Potential" in mesh.point_data:
-            phi = np.array(mesh.point_data["Potential"])
-            compliance_V = float(phi[elec_mask].max())
-        elif elec_mask.any() and "potential" in mesh.point_data:
-            phi = np.array(mesh.point_data["potential"])
-            compliance_V = float(phi[elec_mask].max())
+        tol_z_e = max(z_elec_top * 5e-3, 1e-5)
+
+        def _node_mask_elec(pos3d):
+            m = pts[:, 2] > z_elec_top - tol_z_e
+            if elec_shape == "circle":
+                m &= (np.sqrt((pts[:, 0] - pos3d[0])**2
+                              + (pts[:, 1] - pos3d[1])**2) < elec_r * 1.5)
+            else:
+                m &= ((np.abs(pts[:, 0] - pos3d[0]) < elec_r * 1.5)
+                      & (np.abs(pts[:, 1] - pos3d[1]) < elec_r * 1.5))
+            return m
+
+        active_mask_n = _node_mask_elec(e1_pos3d)
+        return_mask_n = _node_mask_elec(e2_pos3d)
+
+        phi_key = next((k for k in ("Potential", "potential")
+                        if k in mesh.point_data), None)
+        if phi_key and active_mask_n.any():
+            phi = np.array(mesh.point_data[phi_key])
+            V_active_mean = float(phi[active_mask_n].mean())
+            V_return_mean = (float(phi[return_mask_n].mean())
+                             if return_mask_n.any() else 0.0)
+            compliance_V = V_active_mean - V_return_mean
 
         cmp_lim = st.get("compliance_voltage_V", 100.0)
-        if np.isfinite(compliance_V) and compliance_V > cmp_lim:
-            print(f"    WARNING: compliance_V={compliance_V:.1f} V "
-                  f"> limit {cmp_lim:.0f} V — consider reducing current "
-                  f"or increasing electrode size")
+        if np.isfinite(compliance_V):
+            exceeded_compliance = bool(compliance_V > cmp_lim)
+            if exceeded_compliance:
+                print(f"    WARNING: compliance_V={compliance_V:.1f} V "
+                      f"> limit {cmp_lim:.0f} V — consider reducing current "
+                      f"or increasing electrode size")
 
     # ── ROI (cell-based, auto-expanding) ──────────────────────────────────────
     r_cfg   = p["roi"]
@@ -767,13 +788,16 @@ def extract_results(run_dir, p, t_fat, elec_r, e1_pos3d, e2_pos3d,
         "contact_enabled":       body_info.get("contact_enabled", False),
         "sigma_skin":            sig,
         "control_mode":          mode,
+        "jn_used":               _r(jn_used, 4) if jn_used is not None else None,
         "peak_J_skin_with_elec": _r(peak_J_skin_with, 6),
         "peak_J_skin_no_elec":   _r(peak_J_skin_no,   6),
         "roi_mean_J":            _r(mean_J_roi,        6),
         "roi_mean_E":            _r(mean_E_roi,        4),
         "efficiency":            _r(efficiency,        6),
         "compliance_V":          _r(compliance_V,      3),
+        "exceeded_compliance":   exceeded_compliance,
         "total_current_A":       _r(I_active,          8),
+        "I_return_A":            _r(I_return,          8),
         "peak_J_skin_per_A":     _r(_norm(peak_J_skin_no), 4),
         "roi_mean_J_per_A":      _r(_norm(mean_J_roi),     4),
         "roi_mean_E_per_A":      _r(_norm(mean_E_roi),     4),
@@ -792,10 +816,26 @@ def run_sweep(p, t_fat_list, elec_r_list, coarse=False, sigma_skin_override=None
 
     c  = p["conductivities"]
     pl = _pl(p)
+    st = _stim(p)
     sigma_skin = (sigma_skin_override
                   if sigma_skin_override is not None
                   else c["sigma_skin"])
     elec_r_list_m = [r * 1e-3 for r in elec_r_list]  # mm → m
+
+    # ── Control mode banner ───────────────────────────────────────────────────
+    mode = st.get("control_mode", "voltage")
+    print(f"\n{'='*60}")
+    if mode == "current":
+        I_mA    = st.get("injected_current_mA", 5.0)
+        cmp_lim = st.get("compliance_voltage_V", 100.0)
+        print(f"  CONTROL MODE : current")
+        print(f"  Injected I   : {I_mA:.1f} mA  (per-case Neumann BC at active electrode)")
+        print(f"  Compliance   : warn if V_active > {cmp_lim:.0f} V")
+    else:
+        print(f"  CONTROL MODE : voltage")
+        print(f"  V_active = 1.0 V  |  V_return = 0 V  (Dirichlet BCs)")
+        print(f"  Normalise outputs by total_current_A for cross-case comparison")
+    print(f"{'='*60}\n")
 
     for t_fat in t_fat_list:
         for elec_r in elec_r_list_m:
@@ -821,8 +861,8 @@ def run_sweep(p, t_fat_list, elec_r_list, coarse=False, sigma_skin_override=None
                 elmer_dir, e1_pos, e2_pos, body_info["z_elec_top"])
             print(f"    active={e1_id}  return={e2_id}")
 
-            write_sif(run_dir, e1_id, e2_id, p, elec_r, body_info,
-                      sigma_skin_override=sigma_skin_override)
+            jn_used = write_sif(run_dir, e1_id, e2_id, p, elec_r, body_info,
+                                sigma_skin_override=sigma_skin_override)
             (run_dir / "results").mkdir(exist_ok=True)
 
             print("  ElmerSolver ...")
@@ -831,18 +871,58 @@ def run_sweep(p, t_fat_list, elec_r_list, coarse=False, sigma_skin_override=None
             print("  extracting metrics ...")
             res = extract_results(
                 run_dir, p, t_fat, elec_r, e1_pos, e2_pos,
-                body_info, sigma_skin_used=sigma_skin)
+                body_info, sigma_skin_used=sigma_skin, jn_used=jn_used)
 
             print(f"    peak_J_no_elec={res['peak_J_skin_no_elec']:.4f}  "
                   f"roi_mean_E={res['roi_mean_E']:.4f}  "
                   f"efficiency={res['efficiency']:.4e}  "
                   f"flux_err={res['flux_err']:.3e}")
             if res.get("control_mode") == "current":
-                print(f"    compliance_V={res['compliance_V']:.2f} V")
+                I_target = st.get("injected_current_mA", 5.0) * 1e-3
+                I_actual = res.get("total_current_A", float("nan"))
+                print(f"    compliance_V={res['compliance_V']:.2f} V  "
+                      f"I_active={I_actual:.4e} A  I_return={res.get('I_return_A', float('nan')):.4e} A")
+                if np.isfinite(I_actual) and I_target > 0:
+                    dev = abs(I_actual - I_target) / I_target
+                    if dev > 0.05:
+                        print(f"    WARNING: I_active ({I_actual*1e3:.2f} mA) deviates "
+                              f"{dev:.1%} from target {I_target*1e3:.1f} mA — check mesh/BC")
 
             all_results.append(res)
 
     return all_results
+
+
+def print_run_summary(results, p):
+    """Print a human-readable end-of-run summary with files created and example metrics."""
+    st   = _stim(p)
+    mode = st.get("control_mode", "voltage")
+    print(f"\n{'='*60}")
+    print("  RUN COMPLETE — OUTPUTS")
+    print(f"{'='*60}")
+    print(f"  results/summary.csv")
+    print(f"  results/summary.json")
+    print(f"  {len(results)} case(s) computed")
+    if results:
+        ex = results[len(results) // 2]   # middle case as example
+        print(f"\n  Example case  "
+              f"(fat={ex['t_fat_mm']:.1f} mm, r={ex['elec_r_mm']:.1f} mm):")
+        print(f"    control_mode       : {ex.get('control_mode', '?')}")
+        if mode == "current" and ex.get("jn_used") is not None:
+            print(f"    jn_used            : {ex['jn_used']:.4f} A/m²")
+        print(f"    I_active           : {ex.get('total_current_A', float('nan')):.4e} A")
+        print(f"    I_return           : {ex.get('I_return_A', float('nan')):.4e} A")
+        print(f"    flux_err           : {ex.get('flux_err', float('nan')):.3e}")
+        if mode == "current":
+            cV = ex.get("compliance_V", float("nan"))
+            ec = ex.get("exceeded_compliance", False)
+            print(f"    compliance_V       : {cV:.2f} V"
+                  + ("  [EXCEEDED]" if ec else ""))
+        print(f"    peak_J_no_elec     : {ex.get('peak_J_skin_no_elec', float('nan')):.4f} A/m²")
+        print(f"    roi_mean_E         : {ex.get('roi_mean_E', float('nan')):.4f} V/m")
+        print(f"    efficiency         : {ex.get('efficiency', float('nan')):.4e} m")
+    print(f"{'='*60}")
+    print("  Run plot_layered_results.py to generate figures.\n")
 
 
 def save_results(all_results):
@@ -891,4 +971,4 @@ if __name__ == "__main__":
 
     results = run_sweep(p, t_fat_list, r_list_mm, coarse=coarse)
     save_results(results)
-    print("\nAll done. Run plot_layered_results.py to generate figures.")
+    print_run_summary(results, p)

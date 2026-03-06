@@ -7,14 +7,16 @@ Usage (from step03_ankle_layers/):
     python3 plot_layered_results.py
 
 Outputs (in results/):
-    J_surface_maps.png        — |J| heatmaps, linear scale (vmax = vmax_percentile)
-    J_surface_maps_log.png    — same data, log color scale (shows low-J spreading)
+    J_surface_maps_linear.png — |J| heatmaps, linear scale (vmax = vmax_percentile)
+                                Best for: comparing absolute peak J across cases
+    J_surface_maps_log.png    — same data, log color scale
+                                Best for: seeing low-J spreading far from electrodes
     J_surface_maps_masked.png — linear scale with electrode footprints set to NaN
-                                (emphasises current spreading away from electrodes)
+                                Best for: current spreading pattern outside electrodes
     summary_metrics.png       — Raw and normalised metrics vs electrode area
     representative_3d.png     — 3D pyvista render of one case
 
-Plotting options are controlled via params.yaml  plotting:  section.
+All three J maps are always generated regardless of params.yaml flags.
 """
 
 import json
@@ -97,7 +99,7 @@ def plot_J_surface_maps(summary, p):
 
     sig_skin = summary[0].get("sigma_skin", p["conductivities"]["sigma_skin"])
 
-    def _render_figure(norm, levels, out_name, title_suffix, mask_fn=None):
+    def _render_figure(norm, levels, out_name, title_suffix, mask_fn=None, footer=None):
         """Build and save one J-surface heatmap figure."""
         fig, axes = plt.subplots(
             nrows, ncols,
@@ -191,43 +193,47 @@ def plot_J_surface_maps(summary, p):
         sm.set_array([])
         fig.colorbar(sm, ax=axes, label="|J| (A/m²)", shrink=0.6, pad=0.01)
 
+        if footer:
+            fig.text(0.5, -0.01, footer, ha="center", va="top",
+                     fontsize=8, style="italic", color="gray")
+
         out = RESULTS_DIR / out_name
         fig.savefig(out, dpi=140, bbox_inches="tight")
         print(f"Saved → {out}")
         plt.close(fig)
 
-    # ── Linear plot ───────────────────────────────────────────────────────────
+    # ── Linear plot (always generated) ────────────────────────────────────────
     lin_norm   = mcolors.Normalize(vmin=vmin, vmax=vmax)
     lin_levels = np.linspace(vmin, vmax, 31)
-    _render_figure(lin_norm, lin_levels, "J_surface_maps.png",
+    _render_figure(lin_norm, lin_levels, "J_surface_maps_linear.png",
                    f"(linear, {vmax_pct:.2f}th pct max)")
 
-    # ── Log-scale plot ────────────────────────────────────────────────────────
-    if do_log:
-        pos_J      = [j for j in all_J if j > 0]
-        log_vmin   = max(1e-6, float(np.percentile(pos_J, 1))) if pos_J else 1e-6
-        log_norm   = mcolors.LogNorm(vmin=log_vmin, vmax=vmax)
-        log_levels = np.logspace(np.log10(log_vmin), np.log10(vmax), 30)
-        _render_figure(log_norm, log_levels, "J_surface_maps_log.png",
-                       "(log scale)")
+    # ── Log-scale plot (always generated) ────────────────────────────────────
+    pos_J      = [j for j in all_J if j > 0]
+    log_vmin   = max(1e-6, float(np.percentile(pos_J, 1))) if pos_J else 1e-6
+    log_norm   = mcolors.LogNorm(vmin=log_vmin, vmax=vmax)
+    log_levels = np.logspace(np.log10(log_vmin), np.log10(vmax), 30)
+    _render_figure(log_norm, log_levels, "J_surface_maps_log.png",
+                   "(log scale — reveals low-J spreading far from electrodes)")
 
-    # ── Masked-electrode plot ─────────────────────────────────────────────────
-    if do_masked:
-        def _mask_electrodes(Jvals, xp, yp, r_m):
-            Jout = Jvals.copy().astype(float)
-            for ex, ey in [(e1x, e1y), (e2x, e2y)]:
-                if shape == "circle":
-                    inside = np.sqrt((xp - ex)**2 + (yp - ey)**2) < r_m
-                else:
-                    inside = (np.abs(xp - ex) < r_m) & (np.abs(yp - ey) < r_m)
-                Jout[inside] = np.nan
-            return Jout
+    # ── Masked-electrode plot (always generated) ──────────────────────────────
+    def _mask_electrodes(Jvals, xp, yp, r_m):
+        Jout = Jvals.copy().astype(float)
+        for ex, ey in [(e1x, e1y), (e2x, e2y)]:
+            if shape == "circle":
+                inside = np.sqrt((xp - ex)**2 + (yp - ey)**2) < r_m
+            else:
+                inside = (np.abs(xp - ex) < r_m) & (np.abs(yp - ey) < r_m)
+            Jout[inside] = np.nan
+        return Jout
 
-        msk_norm   = mcolors.Normalize(vmin=vmin, vmax=vmax)
-        msk_levels = np.linspace(vmin, vmax, 31)
-        _render_figure(msk_norm, msk_levels, "J_surface_maps_masked.png",
-                       "(electrode footprint masked)",
-                       mask_fn=_mask_electrodes)
+    msk_norm   = mcolors.Normalize(vmin=vmin, vmax=vmax)
+    msk_levels = np.linspace(vmin, vmax, 31)
+    _render_figure(msk_norm, msk_levels, "J_surface_maps_masked.png",
+                   "(electrode footprints masked — shows spreading outside pads)",
+                   mask_fn=_mask_electrodes,
+                   footer="Gray regions under electrode outlines are masked (NaN). "
+                          "Color shows J at skin surface outside electrode footprints only.")
 
 
 # ── Plot 2: raw + normalised summary metrics ──────────────────────────────────
@@ -240,6 +246,10 @@ def plot_summary_metrics(summary, p):
 
     roi_r_mm = p["roi"]["roi_radius"] * 1000
     z_tgt_mm = p["roi"]["z_target"] * 1000
+
+    st = p.get("stim", p.get("control", {}))
+    compliance_lim  = st.get("compliance_voltage_V", 100.0)
+    I_target_mA     = st.get("injected_current_mA", 5.0) if mode == "current" else None
 
     # ── Panel definitions ─────────────────────────────────────────────────────
     # Row 0: raw metrics
@@ -257,33 +267,48 @@ def plot_summary_metrics(summary, p):
          "efficiency",
          "Efficiency  (V/m) / (A/m²) = m"),
     ]
-    # Row 1: normalised + compliance
-    norm_panels = [
-        ("Skin peak |J| / I_injected\n"
-         "Comparable across voltage & current modes",
-         "peak_J_skin_per_A",
-         "Peak |J|(no-elec) / I  (1/m²)"),
-        ("ROI mean |E| / I_injected\n"
-         "Transfer function: deep E-field per unit injected current",
-         "roi_mean_E_per_A",
-         "ROI mean |E| / I  (V/m/A)"),
-        ("Required electrode voltage  [current mode]\n"
-         "Compliance limit exceeded → flag; voltage mode: fixed 1V",
-         "compliance_V",
-         "V_active  (V)"),
-    ]
+    # Row 1: current mode — total_current check + compliance; voltage mode — normalised
+    if mode == "current":
+        norm_panels = [
+            ("Injected current verification\n"
+             "Should be flat at target I — deviations indicate mesh/BC issues",
+             "total_current_A_mA",   # virtual key: we multiply A → mA in draw
+             f"I_active  (mA)"),
+            ("ROI mean |E| / I_injected\n"
+             "Transfer function: deep E-field per unit injected current",
+             "roi_mean_E_per_A",
+             "ROI mean |E| / I  (V/m/A)"),
+            ("Required electrode voltage  (compliance)\n"
+             "Larger electrode → lower V; red line = compliance limit",
+             "compliance_V",
+             "V_active  (V)"),
+        ]
+    else:
+        norm_panels = [
+            ("Skin peak |J| / I_injected\n"
+             "Comparable across voltage & current modes",
+             "peak_J_skin_per_A",
+             "Peak |J|(no-elec) / I  (1/m²)"),
+            ("ROI mean |E| / I_injected\n"
+             "Transfer function: deep E-field per unit injected current",
+             "roi_mean_E_per_A",
+             "ROI mean |E| / I  (V/m/A)"),
+            ("Required electrode voltage  (fixed 1V in voltage mode)\n"
+             "Run in current mode to see compliance variation",
+             "compliance_V",
+             "V_active  (V)"),
+        ]
 
     fig, axes = plt.subplots(2, 3, figsize=(15, 9), constrained_layout=True)
     fig.suptitle(
         f"Electrode size effects — ankle cross-section model  "
         f"[σ_skin={sig_skin} S/m, mode={mode}]  PLACEHOLDER conductivities\n"
         "Each curve = one fat thickness.  "
-        "Row 0: raw.  Row 1: normalised by I_injected + compliance.",
+        "Row 0: raw metrics.  Row 1: "
+        + ("current check + normalised E + compliance." if mode == "current"
+           else "normalised by I_injected + compliance."),
         fontsize=10, fontweight="bold"
     )
-
-    compliance_lim = p.get("stim", p.get("control", {})
-                          ).get("compliance_voltage_V", 100.0)
 
     def _draw_panel(ax, key, ylabel, title):
         for tfat, clr in zip(t_fats, colors):
@@ -294,7 +319,11 @@ def plot_summary_metrics(summary, p):
                 continue
             areas, vals, rmms = [], [], []
             for r in sub:
-                v = r.get(key)
+                if key == "total_current_A_mA":
+                    v_raw = r.get("total_current_A")
+                    v = v_raw * 1e3 if (v_raw is not None and not (isinstance(v_raw, float) and np.isnan(v_raw))) else None
+                else:
+                    v = r.get(key)
                 if v is None or (isinstance(v, float) and np.isnan(v)):
                     continue
                 areas.append(r["elec_area_cm2"])
@@ -309,6 +338,9 @@ def plot_summary_metrics(summary, p):
                             textcoords="offset points", xytext=(5, 3),
                             fontsize=7, color=clr)
 
+        if key == "total_current_A_mA" and I_target_mA is not None:
+            ax.axhline(I_target_mA, color="green", lw=1.5, ls="--",
+                       label=f"target I = {I_target_mA:.1f} mA")
         if key == "compliance_V" and mode == "current":
             ax.axhline(compliance_lim, color="red", lw=1.2, ls="--",
                        label=f"compliance limit ({compliance_lim:.0f} V)")

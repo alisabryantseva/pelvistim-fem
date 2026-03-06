@@ -33,6 +33,12 @@ Top view (x = medial → lateral, y = anterior → posterior):
 | `current` (**default**) | `Current Density = I/A` (uniform Neumann) | `Potential = 0 V` | Matches TENS-like current-regulated devices; compliance voltage reported |
 | `voltage` | `Potential = 1 V` | `Potential = 0 V` | Geometry exploration; normalise outputs by `total_current_A` |
 
+**Choosing a mode:**
+- Use **current mode** (default) when you want to replicate a real device that delivers a fixed mA; outputs directly reflect clinical stimulation at a known current level.
+- Use **voltage mode** for geometry sensitivity studies where you care about relative changes between cases, then divide all J/E outputs by `total_current_A` to normalise.
+
+**Compliance voltage** (`compliance_V` in summary): mean potential at the active electrode minus mean at the return (= 0 V with Dirichlet BC). If `compliance_V > compliance_voltage_V`, the stimulator would clip — increase electrode size or reduce `injected_current_mA`.  The column `exceeded_compliance` is `true` when this limit is breached.
+
 ### Key outputs
 
 | Metric | Units | Description |
@@ -42,9 +48,12 @@ Top view (x = medial → lateral, y = anterior → posterior):
 | `roi_mean_E` | V/m | Mean \|E\| in ROI sphere at ~10 mm depth — efficacy proxy |
 | `roi_mean_J` | A/m² | Mean \|J\| in same ROI sphere |
 | `efficiency` | m | `roi_mean_E / peak_J_skin_no_elec` — deep field per unit skin exposure |
-| `compliance_V` | V | Required electrode voltage (current mode); warn if > `compliance_voltage_V` |
-| `total_current_A` | A | Surface integral of J·dA over active electrode |
-| `flux_err` | — | \|I_active − I_return\| / max(…) — current conservation check |
+| `jn_used` | A/m² | Applied current density at active electrode (current mode only) |
+| `compliance_V` | V | mean(V_active) − mean(V_return); warn if > `compliance_voltage_V` |
+| `exceeded_compliance` | bool | True if compliance_V > limit |
+| `total_current_A` | A | Abs surface integral of J·n at active electrode |
+| `I_return_A` | A | Abs surface integral of J·n at return electrode |
+| `flux_err` | — | \|I_active_signed + I_return_signed\| / max(…) — signed KCL check |
 
 ## What this model is NOT
 
@@ -102,15 +111,17 @@ Progress is printed per case.  With contact layer and ankle geometry, typical ru
 python3 plot_layered_results.py
 ```
 
+All three J-surface maps are **always generated** (no flags needed):
+
 | File | Scale | Best for |
 |------|-------|----------|
-| `results/J_surface_maps.png` | Linear, 0 → 99.95th pct | Side-by-side peak J comparison across cases |
-| `results/J_surface_maps_log.png` | Log scale | Revealing low-J spreading far from electrodes |
-| `results/J_surface_maps_masked.png` | Linear, electrode footprints = NaN | Current spreading pattern outside electrodes |
+| `results/J_surface_maps_linear.png` | Linear, 0 → 99.95th pct | Side-by-side absolute peak J comparison across cases |
+| `results/J_surface_maps_log.png` | Log scale | Revealing low-J current spreading far from electrodes |
+| `results/J_surface_maps_masked.png` | Linear, electrode footprints = NaN | Current spreading pattern **outside** electrode pads only |
 | `results/summary_metrics.png` | — | Metrics vs electrode area: skin peak J, ROI E, efficiency, compliance V |
 | `results/representative_3d.png` | — | 3D pyvista render of one case |
 
-Plot options (`vmax_percentile`, `log_norm`, `make_masked`) are set under `plotting:` in `params.yaml`.
+`vmax_percentile` under `plotting:` in `params.yaml` controls color scale ceiling.
 
 ## Parameters (`params.yaml`)
 
@@ -207,16 +218,19 @@ Suggested references:
 | `contact_enabled` | — | Whether contact layer was used |
 | `sigma_skin` | S/m | Skin conductivity used |
 | `control_mode` | — | `current` or `voltage` |
+| `jn_used` | A/m² | Applied current density at active electrode (current mode only) |
 | `peak_J_skin_with_elec` | A/m² | Max \|J\| at skin surface (including under electrode) |
 | `peak_J_skin_no_elec` | A/m² | Max \|J\| at skin surface **outside** electrode footprints |
 | `roi_mean_J` | A/m² | Mean \|J\| in ROI sphere |
 | `roi_mean_E` | V/m | Mean \|E\| in ROI sphere |
 | `efficiency` | m | `roi_mean_E / peak_J_skin_no_elec` |
-| `compliance_V` | V | Max potential at active electrode (current mode only) |
-| `total_current_A` | A | Injected current from surface integral |
+| `compliance_V` | V | mean(V_active) − mean(V_return) — required drive voltage (current mode) |
+| `exceeded_compliance` | bool | True if compliance_V > `compliance_voltage_V` limit |
+| `total_current_A` | A | Abs surface integral of J·n at active electrode |
+| `I_return_A` | A | Abs surface integral of J·n at return electrode |
 | `peak_J_skin_per_A` | 1/m² | `peak_J_skin_no_elec / total_current_A` |
 | `roi_mean_E_per_A` | V/m/A | `roi_mean_E / total_current_A` |
-| `flux_err` | — | \|I_active − I_return\| / max(…) — conservation error |
+| `flux_err` | — | \|I_active_signed + I_return_signed\| / max(…) — signed KCL error |
 | `roi_layer` | — | Tissue layer containing ROI center |
 | `roi_n_cells` | — | FEM cells in ROI (auto-expanded if < 4) |
 | `roi_radius_used_mm` | mm | Actual ROI radius used |
@@ -235,14 +249,20 @@ Suggested references:
 # Fat thickness × electrode size (default, 9 cases)
 python3 run_layered_sweep.py
 
-# Contact conductivity sensitivity (edit params.yaml between runs)
+# Contact conductivity sensitivity
+# Models dry electrode (low) vs gel-coupled electrode (high)
+# Effect: higher sigma_contact → lower compliance_V, less sensitivity to placement
 for sig in 0.001 0.005 0.02; do
     sed -i "s/sigma_contact_Spm:.*/sigma_contact_Spm: $sig/" params.yaml
     python3 run_layered_sweep.py
     cp results/summary.json results/summary_sigc${sig}.json
 done
 
+# Disable contact layer entirely (bare-skin BC, backward-compatible)
+# Set contact.enabled: false in params.yaml
+
 # Background skin conductivity sensitivity
+# Captures inter-subject variability in skin hydration / stratum corneum thickness
 for sig in 0.0002 0.001 0.005; do
     sed -i "s/sigma_skin:.*/sigma_skin: $sig/" params.yaml
     python3 run_layered_sweep.py
