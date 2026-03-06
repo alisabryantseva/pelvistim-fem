@@ -885,8 +885,9 @@ def run_sweep(p, t_fat_list, elec_r_list, coarse=False, sigma_skin_override=None
                 if np.isfinite(I_actual) and I_target > 0:
                     dev = abs(I_actual - I_target) / I_target
                     if dev > 0.05:
+                        note = " (coarse mesh — expected)" if coarse else " — check mesh/BC"
                         print(f"    WARNING: I_active ({I_actual*1e3:.2f} mA) deviates "
-                              f"{dev:.1%} from target {I_target*1e3:.1f} mA — check mesh/BC")
+                              f"{dev:.1%} from target {I_target*1e3:.1f} mA{note}")
 
             all_results.append(res)
 
