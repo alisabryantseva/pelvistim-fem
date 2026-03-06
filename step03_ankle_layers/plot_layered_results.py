@@ -224,25 +224,29 @@ def plot_J_surface_maps(summary, p):
                     ys_ = [q[1] for q in apt] + [apt[0][1]]
                     ax.plot(xs_, ys_, color="white", lw=0.9, alpha=0.55, zorder=3)
 
-                # ── Electrode outlines — clipped to ankle boundary ──────────────────
+                # ── Electrode outlines — arcs clipped to ankle polygon ──────────────
                 r_m = r_mm / 1000.0
-                # Build clip patch from ankle polygon (clips patches that extend outside)
-                clip_patch = (PathPatch(a_path, transform=ax.transData)
-                              if a_path is not None else None)
 
                 for (xc, yc), lbl, clr in [
                         ((e1x, e1y), "+I", "cyan"),
                         ((e2x, e2y), "0V", "lime")]:
                     if shape == "circle":
-                        patch = plt.Circle((xc, yc), r_m, fill=False,
-                                           edgecolor=clr, lw=1.8, ls="--", zorder=4)
+                        # Parametric arc; insert NaN where outside ankle polygon
+                        theta = np.linspace(0, 2 * np.pi, 721)
+                        ax_pts = xc + r_m * np.cos(theta)
+                        ay_pts = yc + r_m * np.sin(theta)
+                        if a_path is not None:
+                            inside = a_path.contains_points(
+                                np.column_stack([ax_pts, ay_pts]))
+                            ax_pts = np.where(inside, ax_pts, np.nan)
+                            ay_pts = np.where(inside, ay_pts, np.nan)
+                        ax.plot(ax_pts, ay_pts, color=clr, lw=1.8,
+                                ls="--", zorder=4)
                     else:
                         patch = mpatches.Rectangle(
                             (xc - r_m, yc - r_m), 2*r_m, 2*r_m,
                             fill=False, edgecolor=clr, lw=1.8, ls="--", zorder=4)
-                    ax.add_patch(patch)
-                    if clip_patch is not None:
-                        patch.set_clip_path(clip_patch)
+                        ax.add_patch(patch)
                     ax.text(xc, yc, lbl, ha="center", va="center",
                             color=clr, fontsize=7, fontweight="bold", zorder=5)
 
