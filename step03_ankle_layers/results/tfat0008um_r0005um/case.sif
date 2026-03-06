@@ -102,7 +102,7 @@ End
 Boundary Condition 1
   Name = "active_electrode"
   Target Boundaries = 101
-  Current Density = 6.366198e+01  ! I=5.0mA, A=0.785cm²
+  Current Density = 6.462183e+01  ! I=5.0mA, A_mesh=0.7737cm²
 End
 
 Boundary Condition 2
