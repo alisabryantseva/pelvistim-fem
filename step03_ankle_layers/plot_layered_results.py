@@ -99,6 +99,11 @@ def plot_J_surface_maps(summary, p):
 
     sig_skin = summary[0].get("sigma_skin", p["conductivities"]["sigma_skin"])
 
+    # Inferno colormap with black for NaN / out-of-domain
+    _cmap = plt.cm.inferno.copy()
+    _cmap.set_bad("black")
+    _cmap.set_under("black")
+
     def _render_figure(norm, levels, out_name, title_suffix, mask_fn=None, footer=None):
         """Build and save one J-surface heatmap figure."""
         fig, axes = plt.subplots(
@@ -118,20 +123,21 @@ def plot_J_surface_maps(summary, p):
             f"σ_skin={sig_skin} S/m  fat={p['conductivities']['sigma_fat']} S/m  "
             f"muscle={p['conductivities']['sigma_muscle']} S/m  [PLACEHOLDER values]\n"
             f"Color scale: {vmin:.2g} – {vmax:.4f} A/m²  "
-            f"({vmax_pct:.2f}th percentile max)",
+            f"({vmax_pct:.2f}th percentile max)   [black = outside domain or masked]",
             fontsize=9, fontweight="bold"
         )
 
         for ri, tfat in enumerate(t_fats):
             for ci, r_mm in enumerate(radii):
                 ax  = axes[ri][ci]
+                ax.set_facecolor("black")   # outside-domain regions appear black
                 key = (tfat, r_mm)
                 row = next((x for x in summary
                             if x["t_fat_mm"] == tfat and x["elec_r_mm"] == r_mm), None)
 
                 if key not in meshes or row is None:
                     ax.text(0.5, 0.5, "no data", transform=ax.transAxes,
-                            ha="center", va="center")
+                            ha="center", va="center", color="white")
                     ax.axis("off")
                     continue
 
@@ -144,22 +150,23 @@ def plot_J_surface_maps(summary, p):
                     r_m   = r_mm / 1000.0
                     Jvals = mask_fn(Jvals, xp, yp, r_m)
 
-                # For log norm exclude zero/negative; for masked exclude NaN
+                # Exclude non-finite and (for log) non-positive values
+                # Excluded points leave black holes via the axes background
                 valid = np.isfinite(Jvals)
                 if isinstance(norm, mcolors.LogNorm):
-                    valid = valid & (Jvals > 0)
+                    valid = valid & (Jvals > 1e-12)
 
                 if valid.sum() < 3:
                     ax.text(0.5, 0.5, "no valid data", transform=ax.transAxes,
-                            ha="center", va="center")
+                            ha="center", va="center", color="white")
                 else:
                     try:
                         tri = mtri.Triangulation(xp[valid], yp[valid])
                         ax.tricontourf(tri, Jvals[valid], levels=levels,
-                                       cmap="inferno", norm=norm)
+                                       cmap=_cmap, norm=norm, extend="both")
                     except Exception:
                         ax.scatter(xp[valid], yp[valid], c=Jvals[valid],
-                                   cmap="inferno", norm=norm, s=4)
+                                   cmap=_cmap, norm=norm, s=4)
 
                 r_m = r_mm / 1000.0
                 for (xc, yc), lbl, clr in [
@@ -189,7 +196,7 @@ def plot_J_surface_maps(summary, p):
                     fontsize=7.5
                 )
 
-        sm = plt.cm.ScalarMappable(cmap="inferno", norm=norm)
+        sm = plt.cm.ScalarMappable(cmap=_cmap, norm=norm)
         sm.set_array([])
         fig.colorbar(sm, ax=axes, label="|J| (A/m²)", shrink=0.6, pad=0.01)
 
@@ -198,7 +205,7 @@ def plot_J_surface_maps(summary, p):
                      fontsize=8, style="italic", color="gray")
 
         out = RESULTS_DIR / out_name
-        fig.savefig(out, dpi=140, bbox_inches="tight")
+        fig.savefig(out, dpi=160, bbox_inches="tight")
         print(f"Saved → {out}")
         plt.close(fig)
 
@@ -299,13 +306,12 @@ def plot_summary_metrics(summary, p):
              "V_active  (V)"),
         ]
 
-    fig, axes = plt.subplots(2, 3, figsize=(15, 9), constrained_layout=True)
+    fig, axes = plt.subplots(2, 3, figsize=(16, 10), constrained_layout=True)
     fig.suptitle(
-        f"Electrode size effects — ankle cross-section model  "
-        f"[σ_skin={sig_skin} S/m, mode={mode}]  PLACEHOLDER conductivities\n"
-        "Each curve = one fat thickness.  "
+        f"Electrode size effects — ankle cross-section model\n"
+        f"σ_skin={sig_skin} S/m  |  mode={mode}  |  PLACEHOLDER conductivities\n"
         "Row 0: raw metrics.  Row 1: "
-        + ("current check + normalised E + compliance." if mode == "current"
+        + ("injected I check + normalised E + compliance." if mode == "current"
            else "normalised by I_injected + compliance."),
         fontsize=10, fontweight="bold"
     )
@@ -347,17 +353,18 @@ def plot_summary_metrics(summary, p):
 
         ax.set_xlabel("Electrode area (cm²)", fontsize=9)
         ax.set_ylabel(ylabel, fontsize=9)
-        ax.set_title(title, fontsize=8.5)
+        ax.set_title(title, fontsize=8.5, pad=6)
         ax.set_xscale("log")
+        ax.tick_params(axis="both", labelsize=8)
         ax.grid(True, alpha=0.3, linewidth=0.5)
-        ax.legend(fontsize=8, framealpha=0.85)
+        ax.legend(fontsize=8, framealpha=0.85, loc="best")
 
     for row_idx, panels in enumerate([raw_panels, norm_panels]):
         for col_idx, (title, key, ylabel) in enumerate(panels):
             _draw_panel(axes[row_idx][col_idx], key, ylabel, title)
 
     out = RESULTS_DIR / "summary_metrics.png"
-    fig.savefig(out, dpi=150, bbox_inches="tight")
+    fig.savefig(out, dpi=160, bbox_inches="tight")
     print(f"Saved → {out}")
     plt.close(fig)
 
@@ -380,24 +387,101 @@ def plot_3d_representative(summary, p):
         return
 
     g  = p["geometry"]
-    Ly = g["Ly"]
+    Lx, Ly, Lz = g["Lx"], g["Ly"], g["Lz"]
+    pl_cfg = p.get("placement", p.get("electrodes", {}))
+    shape  = pl_cfg.get("electrode_shape", "circle")
+    e1x, e1y = pl_cfg.get("active_xy", [pl_cfg.get("medial_offset", 0.025), Ly/2])
+    e2x, e2y = pl_cfg.get("return_xy", [Lx - pl_cfg.get("lateral_offset", 0.025), Ly/2])
+    r_m = row["elec_r_mm"] / 1000.0
 
-    pl = pv.Plotter(off_screen=True, window_size=(800, 580))
-    pl.set_background("white")
-    clipped = m.clip(normal="y", origin=[0, Ly * 0.5, 0])
-    pl.add_mesh(clipped, scalars="volume current",
-                component=None,
-                scalar_bar_args={"title": "|J| (A/m²)", "width": 0.45,
-                                 "position_x": 0.27, "position_y": 0.04,
-                                 "title_font_size": 12, "label_font_size": 10},
-                cmap="inferno", show_scalar_bar=True)
-    pl.add_mesh(m.outline(), color="gray", line_width=1.5)
-    pl.view_isometric()
-    pl.camera.zoom(1.15)
+    # Compute |J| magnitude and attach to mesh
+    J    = np.array(m.point_data["volume current"])
+    Jmag = np.linalg.norm(J, axis=1)
+    m.point_data["Jmag"] = Jmag
+
+    # Extract top skin surface (z ≈ Lz); contact layer is slightly above, skin at Lz
+    surf = m.extract_surface()
+    cc_z = np.array(surf.cell_centers().points)[:, 2]
+    top_ids = np.where((cc_z > Lz * 0.97) & (cc_z < Lz * 1.05))[0]
+    skin_surf = surf.extract_cells(top_ids) if len(top_ids) > 10 else surf
+
+    # Electrode outline polylines (circles or squares) at z = Lz + small offset
+    z_elec = Lz + 1e-4
+    def _elec_ring(xc, yc, r):
+        theta = np.linspace(0, 2 * np.pi, 60)
+        if shape == "circle":
+            pts = np.column_stack([xc + r * np.cos(theta),
+                                   yc + r * np.sin(theta),
+                                   np.full(60, z_elec)])
+        else:
+            corners = np.array([
+                [xc - r, yc - r, z_elec], [xc + r, yc - r, z_elec],
+                [xc + r, yc + r, z_elec], [xc - r, yc + r, z_elec],
+                [xc - r, yc - r, z_elec],
+            ])
+            return pv.Spline(corners, 20)
+        return pv.Spline(pts, 60)
+
+    Jmag_all  = skin_surf.point_data["Jmag"] if "Jmag" in skin_surf.point_data else None
+    Jmag_vals = Jmag_all if Jmag_all is not None else np.zeros(skin_surf.n_points)
+    vmax_3d   = float(np.percentile(Jmag_vals, 99.9)) if len(Jmag_vals) > 0 else 1.0
+
+    pl_pv = pv.Plotter(off_screen=True, window_size=(900, 720))
+    pl_pv.set_background("black")
+    pl_pv.add_mesh(
+        skin_surf, scalars="Jmag", cmap="inferno",
+        clim=[0, vmax_3d],
+        show_scalar_bar=True,
+        scalar_bar_args={"title": "|J| (A/m²)", "width": 0.40,
+                         "position_x": 0.30, "position_y": 0.04,
+                         "title_font_size": 12, "label_font_size": 10,
+                         "color": "white"},
+    )
+    pl_pv.add_mesh(_elec_ring(e1x, e1y, r_m), color="cyan",  line_width=4)
+    pl_pv.add_mesh(_elec_ring(e2x, e2y, r_m), color="lime",  line_width=4)
+    # Add text labels
+    pl_pv.add_point_labels(
+        np.array([[e1x, e1y, z_elec + 2e-3], [e2x, e2y, z_elec + 2e-3]]),
+        ["+I (active)", "0V (return)"],
+        font_size=12, text_color="white", shape_color="black",
+        show_points=False, always_visible=True,
+    )
+    pl_pv.view_xy()          # top-down view so both pads are visible
+    pl_pv.camera.zoom(1.05)
+
     out = RESULTS_DIR / "representative_3d.png"
-    pl.screenshot(str(out))
-    pl.close()
+    pl_pv.screenshot(str(out))
+    pl_pv.close()
     print(f"Saved → {out}")
+
+
+# ── Sanity check table ────────────────────────────────────────────────────────
+def print_sanity_table(summary):
+    """Print a compact per-case verification table to the console."""
+    if not summary:
+        return
+    mode = summary[0].get("control_mode", "voltage")
+    print(f"\n{'='*80}")
+    print("  RESULTS SANITY CHECK")
+    print(f"{'='*80}")
+    hdr = (f"  {'r(mm)':>6}  {'fat(mm)':>7}  "
+           f"{'I_active(mA)':>13}  {'I_return(mA)':>13}  {'flux_err(%)':>11}")
+    if mode == "current":
+        hdr += f"  {'compliance_V':>13}"
+    print(hdr)
+    print("  " + "-" * (len(hdr) - 2))
+    for row in sorted(summary, key=lambda x: (x["elec_r_mm"], x["t_fat_mm"])):
+        I_a = row.get("total_current_A", float("nan"))
+        I_r = row.get("I_return_A",      float("nan"))
+        fe  = row.get("flux_err",        float("nan"))
+        line = (f"  {row['elec_r_mm']:>6.0f}  {row['t_fat_mm']:>7.1f}  "
+                f"{I_a*1e3:>13.3f}  {I_r*1e3:>13.3f}  {fe*100:>10.2f}%")
+        if mode == "current":
+            cV = row.get("compliance_V", float("nan"))
+            ec = row.get("exceeded_compliance", False)
+            line += f"  {cV:>12.2f}V" + ("  [!]" if ec else "")
+        print(line)
+    print(f"{'='*80}\n")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -409,4 +493,5 @@ if __name__ == "__main__":
     plot_J_surface_maps(summary, p)
     plot_summary_metrics(summary, p)
     plot_3d_representative(summary, p)
+    print_sanity_table(summary)
     print("Done.")

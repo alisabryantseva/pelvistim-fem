@@ -319,8 +319,21 @@ def detect_elec_bc_ids(elmer_mesh_dir, e1_pos, e2_pos, z_elec_top):
     z_max = float(all_z.max())
     tol_z = max(z_max * 5e-3, 1e-5)
 
+    def _elem_area(nids):
+        """Geometric area of a triangular or quad boundary element."""
+        coords = [nodes[n] for n in nids if n in nodes]
+        if len(coords) < 3:
+            return 0.0
+        v0, v1, v2 = coords[0], coords[1], coords[2]
+        a = 0.5 * float(np.linalg.norm(np.cross(v1 - v0, v2 - v0)))
+        if len(coords) == 4:
+            v3 = coords[3]
+            a += 0.5 * float(np.linalg.norm(np.cross(v2 - v0, v3 - v0)))
+        return a
+
     etype_nn = {202: 2, 303: 3, 306: 6, 404: 4}
-    bc_centers = {}
+    bc_centers  = {}
+    bc_elem_nids = {}   # bcid -> list of nid lists, for area computation
     with open(elmer_mesh_dir / "mesh.boundary") as f:
         for line in f:
             parts = line.split()
@@ -344,6 +357,7 @@ def detect_elec_bc_ids(elmer_mesh_dir, e1_pos, e2_pos, z_elec_top):
                 continue
             cxy = np.mean([c[:2] for c in coords], axis=0)
             bc_centers.setdefault(bcid, []).append(cxy)
+            bc_elem_nids.setdefault(bcid, []).append(nids)
 
     bc_mean = {bid: np.mean(pts, axis=0)
                for bid, pts in bc_centers.items() if pts}
@@ -355,7 +369,11 @@ def detect_elec_bc_ids(elmer_mesh_dir, e1_pos, e2_pos, z_elec_top):
                 key=lambda b: np.linalg.norm(bc_mean[b] - e1_pos[:2]))
     e2_id = min(bc_mean,
                 key=lambda b: np.linalg.norm(bc_mean[b] - e2_pos[:2]))
-    return e1_id, e2_id
+
+    e1_area = sum(_elem_area(nids) for nids in bc_elem_nids.get(e1_id, []))
+    e2_area = sum(_elem_area(nids) for nids in bc_elem_nids.get(e2_id, []))
+
+    return e1_id, e2_id, e1_area, e2_area
 
 
 # ── 3. Write Elmer SIF ─────────────────────────────────────────────────────────
@@ -408,7 +426,7 @@ End
 
 
 def write_sif(run_dir, e1_id, e2_id, p, elec_r, body_info,
-              sigma_skin_override=None):
+              sigma_skin_override=None, elec_area_mesh=None):
     c    = p["conductivities"]
     sv   = p["solver"]
     st   = _stim(p)
@@ -498,12 +516,20 @@ End
     if mode == "voltage":
         bc1_active = "  Potential = 1.0"
     else:  # current
-        I_A  = st.get("injected_current_mA", 5.0) * 1e-3
-        area = np.pi * elec_r**2 if shape == "circle" else (2 * elec_r)**2
+        I_A           = st.get("injected_current_mA", 5.0) * 1e-3
+        area_analytic = np.pi * elec_r**2 if shape == "circle" else (2 * elec_r)**2
+        if elec_area_mesh is not None and elec_area_mesh > 0:
+            area = elec_area_mesh
+            rel_err = abs(area - area_analytic) / area_analytic
+            if rel_err > 0.10:
+                print(f"    WARNING: mesh electrode area ({area*1e4:.4f} cm²) "
+                      f"differs {rel_err:.1%} from analytic ({area_analytic*1e4:.4f} cm²)")
+        else:
+            area = area_analytic
         jn   = I_A / area
         jn_used = jn
         bc1_active = (f"  Current Density = {jn:.6e}  "
-                      f"! I={I_A*1e3:.1f}mA, A={area*1e4:.3f}cm²")
+                      f"! I={I_A*1e3:.1f}mA, A_mesh={area*1e4:.4f}cm²")
 
     bcs = f"""
 Boundary Condition 1
@@ -654,7 +680,8 @@ def eval_roi(mesh, roi_cen, roi_radius_init, min_cells=4):
 
 # ── 5c. Extract all metrics from VTU ──────────────────────────────────────────
 def extract_results(run_dir, p, t_fat, elec_r, e1_pos3d, e2_pos3d,
-                    body_info, sigma_skin_used=None, jn_used=None):
+                    body_info, sigma_skin_used=None, jn_used=None,
+                    elec_area_mesh=None, return_area_mesh=None):
     vtu_path = run_dir / "results" / "case_t0001.vtu"
     if not vtu_path.exists():
         raise FileNotFoundError(f"VTU not found: {vtu_path}")
@@ -784,6 +811,8 @@ def extract_results(run_dir, p, t_fat, elec_r, e1_pos3d, e2_pos3d,
         "t_fat_mm":              _r(t_fat * 1000, 2),
         "elec_r_mm":             _r(elec_r * 1000, 2),
         "elec_area_cm2":         _r(area * 1e4, 4),
+        "elec_area_mesh_cm2":    _r(elec_area_mesh * 1e4, 4) if elec_area_mesh else None,
+        "return_area_mesh_cm2":  _r(return_area_mesh * 1e4, 4) if return_area_mesh else None,
         "elec_shape":            elec_shape,
         "contact_enabled":       body_info.get("contact_enabled", False),
         "sigma_skin":            sig,
@@ -856,13 +885,19 @@ def run_sweep(p, t_fat_list, elec_r_list, coarse=False, sigma_skin_override=None
             _run(["ElmerGrid", "14", "2", "mesh.msh", "-out", "elmer_mesh"],
                  cwd=run_dir, label="ElmerGrid")
 
-            print("  detecting electrode BCs ...")
-            e1_id, e2_id = detect_elec_bc_ids(
+            print("  detecting electrode BCs + computing mesh areas ...")
+            e1_id, e2_id, A_active_mesh, A_return_mesh = detect_elec_bc_ids(
                 elmer_dir, e1_pos, e2_pos, body_info["z_elec_top"])
-            print(f"    active={e1_id}  return={e2_id}")
+            area_analytic = (np.pi * elec_r**2 if pl.get("electrode_shape",
+                             pl.get("shape", "circle")) == "circle"
+                             else (2 * elec_r)**2)
+            print(f"    active={e1_id}  return={e2_id}  "
+                  f"A_active={A_active_mesh*1e4:.4f}cm²  "
+                  f"A_analytic={area_analytic*1e4:.4f}cm²")
 
             jn_used = write_sif(run_dir, e1_id, e2_id, p, elec_r, body_info,
-                                sigma_skin_override=sigma_skin_override)
+                                sigma_skin_override=sigma_skin_override,
+                                elec_area_mesh=A_active_mesh)
             (run_dir / "results").mkdir(exist_ok=True)
 
             print("  ElmerSolver ...")
@@ -871,7 +906,8 @@ def run_sweep(p, t_fat_list, elec_r_list, coarse=False, sigma_skin_override=None
             print("  extracting metrics ...")
             res = extract_results(
                 run_dir, p, t_fat, elec_r, e1_pos, e2_pos,
-                body_info, sigma_skin_used=sigma_skin, jn_used=jn_used)
+                body_info, sigma_skin_used=sigma_skin, jn_used=jn_used,
+                elec_area_mesh=A_active_mesh, return_area_mesh=A_return_mesh)
 
             print(f"    peak_J_no_elec={res['peak_J_skin_no_elec']:.4f}  "
                   f"roi_mean_E={res['roi_mean_E']:.4f}  "
