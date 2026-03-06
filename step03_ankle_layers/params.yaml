@@ -6,19 +6,19 @@
 # Replace with literature / measurement values before drawing conclusions.
 #
 # Electrode placement:
-#   active  — medial groove (between tendon and medial malleolus)
-#   return  — posterior-lateral (behind lateral malleolus)
+#   active  — medial-posterior corner; outer edge at medial bone (x=0), posterior edge at Achilles (y=Ly)
+#   return  — lateral-posterior corner; outer edge at lateral bone (x=Lx), posterior edge at Achilles (y=Ly)
 #
-# Cross-section: approximate ankle polygon extruded to depth Lz.
-#   cross_section: "ankle"  — 12-point rounded polygon (default)
-#   cross_section: "rect"   — rectangular slab (backward-compatible)
+# Cross-section: rectangular slab — full medial-lateral × anterior-posterior box.
+#   cross_section: "rect"   — rectangular slab (used here)
+#   cross_section: "ankle"  — 12-point rounded polygon (legacy)
 # =============================================================================
 
 geometry:
-  Lx: 0.080       # bounding box medial-lateral width  (m)  ~8 cm
-  Ly: 0.060       # bounding box anterior-posterior     (m)  ~6 cm
-  Lz: 0.040       # total slab depth                   (m)  ~4 cm
-  cross_section: "ankle"   # "ankle" or "rect"
+  Lx: 0.080       # medial-lateral width   (m)  ~8 cm  (x=0: medial bone, x=Lx: lateral bone)
+  Ly: 0.060       # anterior-posterior     (m)  ~6 cm  (y=0: front of ankle, y=Ly: back/Achilles)
+  Lz: 0.040       # total slab depth       (m)  ~4 cm
+  cross_section: "rect"    # "rect" (full rectangular slab) or "ankle" (polygon)
 
 layers:
   t_skin: 0.0015           # skin thickness (m) ~1.5 mm — PLACEHOLDER
@@ -48,11 +48,21 @@ contact:
   sigma_contact_Spm: 0.005     # effective contact conductivity (S/m) — PLACEHOLDER
 
 # ── Electrode placement and sweep ─────────────────────────────────────────────
+# Both electrodes have their outer (bone-side) edge flush against the bone face
+# and their posterior edge at the back of the ankle (y = Ly).
+# Center positions are set so that for the LARGEST electrode (r=15mm) the disk
+# just reaches x=0 (medial bone) / x=Lx (lateral bone) and y=Ly (Achilles side).
+#
+#   active (stim, medial):   center = (r_max, Ly − r_max) = (15mm, 45mm)
+#   return (ground, lateral): center = (Lx − r_max, Ly − r_max) = (65mm, 45mm)
+#
+# For smaller radii the electrode sits fully inside the domain with a gap to
+# the bone face — matching the physical electrode-on-skin geometry.
 placement:
-  active_xy: [0.020, 0.030]    # m: medial groove  (x_medial, mid-y)
-  return_xy:  [0.068, 0.046]   # m: posterior-lateral (x_lateral, y_posterior)
+  active_xy: [0.015, 0.045]    # m: medial-posterior corner (left edge → medial bone)
+  return_xy:  [0.065, 0.045]   # m: lateral-posterior corner (right edge → lateral bone)
   electrode_shape: "circle"    # "circle" or "square"
-  electrode_r_mm_list: [5, 10, 15]   # electrode radii (m) for full sweep
+  electrode_r_mm_list: [5, 10, 15]   # electrode radii for full sweep
 
 mesh:
   lc_global_mm:   3.0    # background element size (mm)
