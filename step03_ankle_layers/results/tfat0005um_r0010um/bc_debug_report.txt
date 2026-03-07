@@ -1,0 +1,25 @@
+BC DEBUG REPORT — tfat0005um_r0010um
+============================================================
+  control_mode     : current
+  injected_current : 5.0 mA  (5.0000e-03 A)
+
+  Elmer boundary ID — active  : 101
+  Elmer boundary ID — return  : 102
+
+  Mesh area — active electrode : 3.1299 cm²
+  Mesh area — return electrode : 3.1299 cm²
+
+  Current density applied (Jn) : 1.597501e+01 A/m²
+  Expected current (Jn * A)    : 5.0000 mA
+  Target current               : 5.0000 mA
+  Pre-solve area error         : 0.00%
+
+  Elmer BC keyword used: 'Current Density = Jn'
+  Elmer interprets this as uniform normal J (A/m²) Neumann BC.
+  n_outward at top face = +z; current INTO tissue has J_z < 0.
+  This BC applies ONLY to the active electrode surface.
+  Return electrode is Dirichlet: Potential = 0.
+
+  contact_enabled  : True
+  z_skin_top       : 40.00 mm
+  z_elec_top       : 40.50 mm
