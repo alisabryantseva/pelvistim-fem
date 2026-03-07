@@ -958,7 +958,7 @@ def plot_model_diagram(p, summary=None):
     ax_top.set_ylabel("Anterior → Posterior  (m)", color=TC, fontsize=9)
     ax_top.set_title(
         f"SKIN SURFACE (top view, z = {Lz*1000:.0f} mm)\n"
-        f"Dashed circles = current spreading pattern  |  r = {r_mid_mm:.0f} mm",
+        f"Ankle polygon = actual FEM domain  |  r = {r_mid_mm:.0f} mm",
         color=TC, fontsize=9, fontweight="bold")
 
     # ─── Panel 3: |J| vs depth below active electrode ─────────────────────────
@@ -991,7 +991,7 @@ def plot_model_diagram(p, summary=None):
                 valid   = np.isfinite(bin_J)
                 if valid.sum() >= 3:
                     depth_data     = bin_d[valid]
-                    Jmag_data      = np.array(bin_J)[valid]
+                    Jmag_data      = np.array(bin_J)[valid] * 0.1  # A/m² → mA/cm²
                     profile_source = vtu_label
         except Exception as exc:
             print(f"  model_diagram: profile extraction failed: {exc}")
@@ -1003,13 +1003,13 @@ def plot_model_diagram(p, summary=None):
         ax.fill_betweenx(depth_data, 0, Jmag_data, color="cyan", alpha=0.18)
         Jmax = float(Jmag_data.max()) if len(Jmag_data) > 0 else 1.0
     else:
-        # Schematic profile (exponential-like decay as placeholder)
+        # Schematic profile (exponential-like decay as placeholder); units mA/cm²
         d_sch  = np.linspace(0, Lz*1000, 200)
-        J_sch  = np.exp(-d_sch / 12) * 5.0
+        J_sch  = np.exp(-d_sch / 12) * 0.5   # ~0.5 mA/cm² peak (≈5 A/m²)
         ax.plot(J_sch, d_sch, color="cyan", lw=2.0, ls="--", zorder=5,
                 label="Schematic (no VTU)")
         ax.fill_betweenx(d_sch, 0, J_sch, color="cyan", alpha=0.12)
-        Jmax = 5.5
+        Jmax = 0.55
         depth_data = d_sch
 
     ax.set_ylim(depth_data.max() + 1, -1)   # depth increases downward
@@ -1055,14 +1055,14 @@ def plot_model_diagram(p, summary=None):
             jav = _layer_avg(d0, d1)
             if np.isfinite(jav):
                 dmid = (d0 + d1) / 2
-                ax.annotate(f"avg={jav:.3f}\nA/m²",
+                ax.annotate(f"avg={jav:.3f}\nmA/cm²",
                             xy=(jav, dmid),
                             xytext=(Jmax * 0.55, dmid),
                             fontsize=7, color=clr, ha="center", va="center",
                             arrowprops=dict(arrowstyle="->", color=clr,
                                            lw=0.7, alpha=0.6))
 
-    ax.set_xlabel("|J|  (A/m²)", color=TC, fontsize=9)
+    ax.set_xlabel("|J|  (mA/cm²)", color=TC, fontsize=9)
     ax.set_ylabel("Depth below skin surface  (mm)", color=TC, fontsize=9)
     ax.set_title(
         f"|J| vs depth below active electrode\n"
