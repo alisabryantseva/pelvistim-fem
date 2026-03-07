@@ -564,6 +564,60 @@ def _run(cmd, cwd, label):
         sys.exit(1)
 
 
+# ── 4b. BC debug report (saved per case) ──────────────────────────────────────
+def save_bc_debug_report(run_dir, label, e1_id, e2_id, A_active_mesh,
+                         A_return_mesh, jn_used, p, body_info):
+    """
+    Save a text report documenting the Neumann BC setup for one case.
+    Helps diagnose current-control bugs by showing what was applied and why.
+    """
+    st   = _stim(p)
+    mode = st.get("control_mode", "voltage")
+    I_mA = st.get("injected_current_mA", 5.0)
+    I_A  = I_mA * 1e-3
+
+    lines = [
+        f"BC DEBUG REPORT — {label}",
+        "=" * 60,
+        f"  control_mode     : {mode}",
+        f"  injected_current : {I_mA} mA  ({I_A:.4e} A)",
+        "",
+        f"  Elmer boundary ID — active  : {e1_id}",
+        f"  Elmer boundary ID — return  : {e2_id}",
+        "",
+        f"  Mesh area — active electrode : {A_active_mesh*1e4:.4f} cm²",
+        f"  Mesh area — return electrode : {A_return_mesh*1e4:.4f} cm²",
+    ]
+    if mode == "current" and jn_used is not None:
+        expected = jn_used * A_active_mesh
+        lines += [
+            "",
+            f"  Current density applied (Jn) : {jn_used:.6e} A/m²",
+            f"  Expected current (Jn * A)    : {expected*1e3:.4f} mA",
+            f"  Target current               : {I_mA:.4f} mA",
+            f"  Pre-solve area error         : {abs(expected - I_A)/I_A*100:.2f}%",
+            "",
+            "  Elmer BC keyword used: 'Current Density = Jn'",
+            "  Elmer interprets this as uniform normal J (A/m²) Neumann BC.",
+            "  n_outward at top face = +z; current INTO tissue has J_z < 0.",
+            "  This BC applies ONLY to the active electrode surface.",
+            "  Return electrode is Dirichlet: Potential = 0.",
+        ]
+
+    contact = body_info.get("contact_enabled", False)
+    lines += [
+        "",
+        f"  contact_enabled  : {contact}",
+        f"  z_skin_top       : {body_info['z_skin_top']*1000:.2f} mm",
+        f"  z_elec_top       : {body_info['z_elec_top']*1000:.2f} mm",
+    ]
+
+    report = "\n".join(lines) + "\n"
+    out    = run_dir / "bc_debug_report.txt"
+    out.write_text(report)
+    print(f"    BC debug → {out.relative_to(run_dir.parent.parent)}")
+
+
 # ── 5a. Surface flux integral (electrode current) ──────────────────────────────
 def compute_injected_current(mesh, e1_pos3d, e2_pos3d, elec_r, z_elec_top,
                              elec_shape="circle"):
@@ -571,20 +625,36 @@ def compute_injected_current(mesh, e1_pos3d, e2_pos3d, elec_r, z_elec_top,
     Integrate J·n_outward over each electrode patch at z ≈ z_elec_top.
     n_outward = +z at top face; J_z < 0 means current enters tissue.
 
+    FIX: Uses only embedded 2D boundary cells (VTK type 5=triangle, 9=quad)
+    from the VTU, NOT extract_surface(). extract_surface() on a mixed-dimension
+    VTU (3D tets + 2D boundary triangles) double-counts each boundary face:
+    once as the standalone 2D triangle cell AND once as the external face of
+    the adjacent tet — causing ~2× overestimate of injected current.
+
     elec_shape: "circle" — distance < elec_r*(1+0.2)
                 "square" — |dx| < elec_r*(1+0.2)  and  |dy| < elec_r*(1+0.2)
 
-    Returns: (I_active_A, I_return_A, flux_err)
+    Returns: (I_active_abs, I_return_abs, flux_err, I_active_signed, I_return_signed)
     """
     tol_z     = max(z_elec_top * 5e-3, 1e-5)
     tolerance = 0.2
 
-    surface    = mesh.extract_surface(algorithm="dataset_surface")
-    surface_cd = surface.point_data_to_cell_data()
-    J_cells    = np.array(surface_cd.cell_data["volume current"])
-    cell_pts   = np.array(surface.cell_centers().points)
+    # Extract only 2D boundary cells to avoid double-counting
+    ctypes  = mesh.celltypes
+    bnd_ids = np.where(np.isin(ctypes, [5, 9]))[0]
 
-    sizes = surface.compute_cell_sizes()
+    if len(bnd_ids) == 0:
+        print("    WARNING: No 2D boundary cells (type 5/9) found in VTU — "
+              "falling back to extract_surface() [results may be 2× too large]")
+        bnd_mesh = mesh.extract_surface(algorithm="dataset_surface")
+    else:
+        bnd_mesh = mesh.extract_cells(bnd_ids)
+
+    bnd_cd   = bnd_mesh.point_data_to_cell_data()
+    J_cells  = np.array(bnd_cd.cell_data["volume current"])
+    cell_pts = np.array(bnd_mesh.cell_centers().points)
+
+    sizes = bnd_mesh.compute_cell_sizes()
     areas = np.array(sizes.cell_data["Area"])
 
     top_mask = cell_pts[:, 2] > z_elec_top - tol_z
@@ -603,18 +673,18 @@ def compute_injected_current(mesh, e1_pos3d, e2_pos3d, elec_r, z_elec_top,
     return_mask = _mask(e2_pos3d)
 
     if not active_mask.any() or not return_mask.any():
-        return np.nan, np.nan, np.nan
+        return np.nan, np.nan, np.nan, np.nan, np.nan
 
     # Signed integrals: inward at active → negative; outward at return → positive
     I_active_signed = float(np.sum(J_cells[active_mask, 2] * areas[active_mask]))
     I_return_signed = float(np.sum(J_cells[return_mask, 2] * areas[return_mask]))
-    I_active = abs(I_active_signed)
-    I_return = abs(I_return_signed)
-    denom    = max(I_active, I_return)
-    # KCL: signed sum should be near 0 if current is conserved
+    I_active_abs    = abs(I_active_signed)
+    I_return_abs    = abs(I_return_signed)
+    denom           = max(I_active_abs, I_return_abs)
+    # KCL: signed sum should ≈ 0 if current is conserved
     flux_err = float(abs(I_active_signed + I_return_signed) / denom) if denom > 0 else np.nan
 
-    return I_active, I_return, flux_err
+    return I_active_abs, I_return_abs, flux_err, I_active_signed, I_return_signed
 
 
 # ── 5b. ROI evaluation (cell-based, never NaN) ────────────────────────────────
@@ -681,7 +751,8 @@ def eval_roi(mesh, roi_cen, roi_radius_init, min_cells=4):
 # ── 5c. Extract all metrics from VTU ──────────────────────────────────────────
 def extract_results(run_dir, p, t_fat, elec_r, e1_pos3d, e2_pos3d,
                     body_info, sigma_skin_used=None, jn_used=None,
-                    elec_area_mesh=None, return_area_mesh=None):
+                    elec_area_mesh=None, return_area_mesh=None,
+                    e1_elmer_id=None, e2_elmer_id=None):
     vtu_path = run_dir / "results" / "case_t0001.vtu"
     if not vtu_path.exists():
         raise FileNotFoundError(f"VTU not found: {vtu_path}")
@@ -723,11 +794,23 @@ def extract_results(run_dir, p, t_fat, elec_r, e1_pos3d, e2_pos3d,
         peak_J_skin_no = np.nan
 
     # ── Total injected current ────────────────────────────────────────────────
-    I_active, I_return, flux_err = compute_injected_current(
+    (I_active, I_return, flux_err,
+     I_active_signed, I_return_signed) = compute_injected_current(
         mesh, e1_pos3d, e2_pos3d, elec_r, z_elec_top, elec_shape)
     print(f"    I_active={I_active:.4e} A  "
           f"I_return={I_return:.4e} A  "
           f"flux_err={flux_err:.2e}")
+
+    # Hard 2% warning for current-mode deviations
+    st_inner = _stim(p)
+    if st_inner.get("control_mode", "voltage") == "current":
+        I_target_inner = st_inner.get("injected_current_mA", 5.0) * 1e-3
+        if np.isfinite(I_active) and I_target_inner > 0:
+            dev = abs(I_active - I_target_inner) / I_target_inner
+            if dev > 0.02:
+                print(f"    *** CURRENT ERROR > 2%: measured {I_active*1e3:.3f} mA "
+                      f"vs target {I_target_inner*1e3:.1f} mA "
+                      f"({dev:.1%} deviation) ***")
 
     # ── Compliance voltage (current mode) ─────────────────────────────────────
     st   = _stim(p)
@@ -776,6 +859,27 @@ def extract_results(run_dir, p, t_fat, elec_r, e1_pos3d, e2_pos3d,
         mesh, roi_cen, r_cfg["roi_radius"])
     if roi_warn:
         print(f"    ROI: {roi_warn}")
+
+    # ── ROI layer metadata ────────────────────────────────────────────────────
+    ls_p    = p["layers"]
+    t_sk    = ls_p["t_skin"]
+    z_fat_bot = z_skin_top - t_sk - t_fat          # fat–muscle interface z
+    z_fat_top = z_skin_top - t_sk                  # skin–fat interface z
+    dist_fat_muscle_mm = abs(z_nerve - z_fat_bot) * 1000.0
+
+    # Fraction of ROI cells in each layer (using cell centers from eval_roi)
+    mesh_cd_roi  = mesh.point_data_to_cell_data()
+    cell_pts_all = np.array(mesh_cd_roi.cell_centers().points)
+    dist_all     = np.linalg.norm(cell_pts_all - roi_cen, axis=1)
+    roi_mask_all = dist_all < roi_r_used
+    if roi_mask_all.any():
+        z_roi = cell_pts_all[roi_mask_all, 2]
+        n_roi = roi_mask_all.sum()
+        frac_skin   = float((z_roi > z_fat_top).sum())   / n_roi
+        frac_fat    = float(((z_roi > z_fat_bot) & (z_roi <= z_fat_top)).sum()) / n_roi
+        frac_muscle = float((z_roi <= z_fat_bot).sum())  / n_roi
+    else:
+        frac_skin = frac_fat = frac_muscle = np.nan
 
     # ── Electrode area ────────────────────────────────────────────────────────
     area = np.pi * elec_r**2 if elec_shape == "circle" else (2 * elec_r)**2
@@ -826,7 +930,9 @@ def extract_results(run_dir, p, t_fat, elec_r, e1_pos3d, e2_pos3d,
         "compliance_V":          _r(compliance_V,      3),
         "exceeded_compliance":   exceeded_compliance,
         "total_current_A":       _r(I_active,          8),
+        "I_active_signed_A":     _r(I_active_signed,   8),
         "I_return_A":            _r(I_return,          8),
+        "I_return_signed_A":     _r(I_return_signed,   8),
         "peak_J_skin_per_A":     _r(_norm(peak_J_skin_no), 4),
         "roi_mean_J_per_A":      _r(_norm(mean_J_roi),     4),
         "roi_mean_E_per_A":      _r(_norm(mean_E_roi),     4),
@@ -835,6 +941,15 @@ def extract_results(run_dir, p, t_fat, elec_r, e1_pos3d, e2_pos3d,
         "roi_layer":             roi_layer,
         "roi_n_cells":           roi_n_cells,
         "roi_radius_used_mm":    _r(roi_r_used * 1000, 2),
+        # ── ROI layer metadata (PART 3) ──────────────────────────────────────
+        "roi_center_z_mm":       _r(z_nerve * 1000, 3),
+        "dist_fat_muscle_mm":    _r(dist_fat_muscle_mm, 3),
+        "roi_frac_muscle":       _r(frac_muscle, 4),
+        "roi_frac_fat":          _r(frac_fat,    4),
+        "roi_frac_skin":         _r(frac_skin,   4),
+        # ── BC boundary IDs (PART 2) ─────────────────────────────────────────
+        "active_boundary_id_used": e1_elmer_id,
+        "return_boundary_id_used": e2_elmer_id,
     }
 
 
@@ -898,6 +1013,9 @@ def run_sweep(p, t_fat_list, elec_r_list, coarse=False, sigma_skin_override=None
             jn_used = write_sif(run_dir, e1_id, e2_id, p, elec_r, body_info,
                                 sigma_skin_override=sigma_skin_override,
                                 elec_area_mesh=A_active_mesh)
+            save_bc_debug_report(run_dir, label, e1_id, e2_id,
+                                 A_active_mesh, A_return_mesh,
+                                 jn_used, p, body_info)
             (run_dir / "results").mkdir(exist_ok=True)
 
             print("  ElmerSolver ...")
@@ -907,7 +1025,8 @@ def run_sweep(p, t_fat_list, elec_r_list, coarse=False, sigma_skin_override=None
             res = extract_results(
                 run_dir, p, t_fat, elec_r, e1_pos, e2_pos,
                 body_info, sigma_skin_used=sigma_skin, jn_used=jn_used,
-                elec_area_mesh=A_active_mesh, return_area_mesh=A_return_mesh)
+                elec_area_mesh=A_active_mesh, return_area_mesh=A_return_mesh,
+                e1_elmer_id=e1_id, e2_elmer_id=e2_id)
 
             print(f"    peak_J_no_elec={res['peak_J_skin_no_elec']:.4f}  "
                   f"roi_mean_E={res['roi_mean_E']:.4f}  "

@@ -143,7 +143,8 @@ def plot_J_surface_maps(summary, p):
     _cmap.set_bad("black")
     _cmap.set_under("black")
 
-    def _render_figure(norm, levels, out_name, title_suffix, mask_fn=None, footer=None):
+    def _render_figure(norm, levels, out_name, title_suffix, mask_fn=None,
+                       footer=None, add_contours=False):
         """Build and save one J-surface heatmap figure."""
         fig, axes = plt.subplots(
             nrows, ncols,
@@ -213,6 +214,21 @@ def plot_J_surface_maps(summary, p):
                             tri.set_mask(outside)
                         ax.tricontourf(tri, Jvals[valid], levels=levels,
                                        cmap=_cmap, norm=norm, extend="both")
+                        # Contour lines for masked map (shows spreading pattern)
+                        if add_contours and isinstance(norm, mcolors.Normalize):
+                            J_fin = Jvals[valid]
+                            J_fin_pos = J_fin[np.isfinite(J_fin) & (J_fin > 0)]
+                            if len(J_fin_pos) > 0:
+                                vmax_c = float(np.nanmax(J_fin_pos))
+                                for frac, ls_c in [(0.10, ":"), (0.25, "--"), (0.50, "-")]:
+                                    lvl_c = vmax_c * frac
+                                    if lvl_c > 0:
+                                        ax.tricontour(tri, Jvals[valid],
+                                                      levels=[lvl_c],
+                                                      colors=["white"],
+                                                      linewidths=[0.7],
+                                                      linestyles=[ls_c],
+                                                      alpha=0.55)
                     except Exception:
                         ax.scatter(xp[valid], yp[valid], c=Jvals[valid],
                                    cmap=_cmap, norm=norm, s=4)
@@ -318,8 +334,10 @@ def plot_J_surface_maps(summary, p):
     _render_figure(msk_norm, msk_levels, "J_surface_maps_masked.png",
                    "(electrode footprints masked — shows spreading outside pads)",
                    mask_fn=_mask_electrodes,
-                   footer="Gray regions under electrode outlines are masked (NaN). "
-                          "Color shows J at skin surface outside electrode footprints only.")
+                   add_contours=True,
+                   footer="Black under electrode outlines = masked (NaN). "
+                          "White contour lines: 10/25/50% of local |J| max. "
+                          "Color shows J at skin surface outside electrode footprints.")
 
 
 # ── Plot 2: raw + normalised summary metrics ──────────────────────────────────
@@ -534,33 +552,604 @@ def plot_3d_representative(summary, p):
     print(f"Saved → {out}")
 
 
+# ── Plot 4: horizontal depth-slice |E| maps ───────────────────────────────────
+def plot_depth_slice_E_maps(summary, p):
+    """
+    For each case: slice the 3D mesh at z = z_nerve (ROI depth) and plot |E|.
+    E = -grad(Potential) computed by pyvista, then sliced at the target depth.
+
+    Output: results/depth_slice_E_maps.png
+    """
+    t_fats = sorted(set(r["t_fat_mm"]  for r in summary))
+    radii  = sorted(set(r["elec_r_mm"] for r in summary))
+    nrows, ncols = len(t_fats), len(radii)
+
+    g  = p["geometry"]
+    Lx, Ly, Lz = g["Lx"], g["Ly"], g["Lz"]
+    ls = p["layers"]
+    r_cfg = p["roi"]
+    pl_cfg = p.get("placement", p.get("electrodes", {}))
+    shape  = pl_cfg.get("electrode_shape", "circle")
+    e1x, e1y = pl_cfg.get("active_xy",  [0.015, 0.045])
+    e2x, e2y = pl_cfg.get("return_xy",  [0.065, 0.045])
+    t_skin = ls["t_skin"]
+    z_target = r_cfg["z_target"]
+    z_skin_top = Lz   # skin top (no contact layer offset for display)
+
+    _cmap = plt.cm.inferno.copy()
+    _cmap.set_bad("black")
+    _cmap.set_under("black")
+
+    # ── Collect |E| at slice depth for global color scale ─────────────────────
+    all_E  = []
+    slices = {}
+    for row in summary:
+        m = load_vtu(row["t_fat_mm"], row["elec_r_mm"])
+        if m is None:
+            continue
+        phi_key = next((k for k in ("Potential", "potential")
+                        if k in m.point_data), None)
+        if phi_key is None:
+            continue
+        try:
+            grad_m = m.compute_derivative(scalars=phi_key)
+            E_pts  = -np.array(grad_m.point_data["gradient"])
+            Emag   = np.linalg.norm(E_pts, axis=1)
+            grad_m["Emag"] = Emag
+        except Exception as exc:
+            print(f"    depth_slice: grad failed for "
+                  f"fat={row['t_fat_mm']} r={row['elec_r_mm']}: {exc}")
+            continue
+
+        # Slice at ROI depth. z_nerve is measured from skin top downward.
+        z_nerve = z_skin_top - z_target
+        try:
+            slc = grad_m.slice(normal="z", origin=[Lx/2, Ly/2, z_nerve])
+            if slc.n_points < 3:
+                continue
+        except Exception:
+            continue
+
+        xp  = np.array(slc.points[:, 0])
+        yp  = np.array(slc.points[:, 1])
+        Ep  = np.array(slc.point_data["Emag"])
+        valid = np.isfinite(Ep) & (Ep > 0)
+        all_E.extend(Ep[valid].tolist())
+        slices[(row["t_fat_mm"], row["elec_r_mm"])] = (xp, yp, Ep, row)
+
+    if not slices:
+        print("  depth_slice_E_maps: no slice data found (no VTU or no Potential field).")
+        return
+
+    vmax_pct = float(p.get("plotting", {}).get("vmax_percentile", 99.95))
+    vmax_E   = float(np.percentile(all_E, vmax_pct)) if all_E else 1.0
+    vmin_E   = 0.0
+    norm_E   = mcolors.Normalize(vmin=vmin_E, vmax=vmax_E)
+    levels_E = np.linspace(vmin_E, vmax_E, 31)
+
+    fig, axes = plt.subplots(
+        nrows, ncols,
+        figsize=(4.5 * ncols, 4 * nrows),
+        constrained_layout=True)
+    if nrows == 1 and ncols == 1:
+        axes = np.array([[axes]])
+    elif nrows == 1:
+        axes = axes[np.newaxis, :]
+    elif ncols == 1:
+        axes = axes[:, np.newaxis]
+
+    z_nerve_mm = (z_skin_top - z_target) * 1000
+    fig.suptitle(
+        f"|E| horizontal slice at z = {z_nerve_mm:.1f} mm  "
+        f"(ROI depth: {z_target*1000:.0f} mm below skin top)\n"
+        f"Color scale: 0 – {vmax_E:.2f} V/m  ({vmax_pct:.2f}th pct)   "
+        f"[black = no data]",
+        fontsize=9, fontweight="bold")
+
+    for ri, tfat in enumerate(t_fats):
+        for ci, r_mm in enumerate(radii):
+            ax  = axes[ri][ci]
+            ax.set_facecolor("black")
+            key = (tfat, r_mm)
+            if key not in slices:
+                ax.text(0.5, 0.5, "no data", transform=ax.transAxes,
+                        ha="center", va="center", color="white")
+                ax.axis("off")
+                continue
+
+            xp, yp, Ep, row = slices[key]
+            valid = np.isfinite(Ep)
+
+            if valid.sum() >= 3:
+                try:
+                    tri = mtri.Triangulation(xp[valid], yp[valid])
+                    ax.tricontourf(tri, Ep[valid], levels=levels_E,
+                                   cmap=_cmap, norm=norm_E, extend="both")
+                    # Contour lines at 25%, 50%, 75% of vmax
+                    for frac, ls_style in [(0.25, ":"), (0.50, "--"), (0.75, "-")]:
+                        lvl = vmax_E * frac
+                        if lvl > Ep[valid].min():
+                            ax.tricontour(tri, Ep[valid], levels=[lvl],
+                                          colors=["white"], linewidths=[0.8],
+                                          linestyles=[ls_style], alpha=0.6)
+                except Exception:
+                    ax.scatter(xp[valid], yp[valid], c=Ep[valid],
+                               cmap=_cmap, norm=norm_E, s=4)
+
+            # Electrode outline circles
+            r_m = r_mm / 1000.0
+            for (xc, yc), lbl, clr in [
+                    ((e1x, e1y), "+I", "cyan"),
+                    ((e2x, e2y), "0V", "lime")]:
+                if shape == "circle":
+                    theta = np.linspace(0, 2 * np.pi, 361)
+                    ax.plot(xc + r_m * np.cos(theta),
+                            yc + r_m * np.sin(theta),
+                            color=clr, lw=1.5, ls="--", zorder=4)
+                else:
+                    patch = mpatches.Rectangle(
+                        (xc - r_m, yc - r_m), 2*r_m, 2*r_m,
+                        fill=False, edgecolor=clr, lw=1.5, ls="--", zorder=4)
+                    ax.add_patch(patch)
+                ax.text(xc, yc, lbl, ha="center", va="center",
+                        color=clr, fontsize=7, fontweight="bold", zorder=5)
+
+            # ROI circle
+            roi_r = r_cfg["roi_radius"]
+            roi_theta = np.linspace(0, 2*np.pi, 181)
+            ax.plot(e1x + roi_r * np.cos(roi_theta),
+                    e1y + roi_r * np.sin(roi_theta),
+                    color="yellow", lw=1.2, ls="-", alpha=0.8, zorder=4)
+            ax.text(e1x, e1y - roi_r * 1.4, "ROI",
+                    ha="center", va="top", color="yellow", fontsize=6, zorder=5)
+
+            # Achilles tendon marker (same position as J maps)
+            ax.plot(Lx * 0.50, Ly * 0.96, '^', color='white', ms=5,
+                    mfc='white', mew=1.0, zorder=5)
+            ax.text(Lx * 0.50, Ly * 0.96 - Ly * 0.05, 'AT',
+                    ha='center', va='top', color='white',
+                    fontsize=5, fontweight='bold', zorder=5)
+
+            ax.set_xlim(0, Lx); ax.set_ylim(0, Ly)
+            ax.set_aspect("equal")
+            ax.set_xlabel("Medial → Lateral  (m)", fontsize=7)
+            ax.set_ylabel("Anterior → Posterior  (m)", fontsize=7)
+            re_val = row.get("roi_mean_E", float("nan"))
+            ax.set_title(
+                f"fat={tfat:.0f} mm  |  r={r_mm:.0f} mm\n"
+                f"ROI mean|E|={re_val:.3f} V/m  "
+                f"(white contours: 25/50/75% of vmax)",
+                fontsize=7.5)
+
+    sm = plt.cm.ScalarMappable(cmap=_cmap, norm=norm_E)
+    sm.set_array([])
+    fig.colorbar(sm, ax=axes, label="|E| (V/m)", shrink=0.6, pad=0.01)
+
+    out = RESULTS_DIR / "depth_slice_E_maps.png"
+    fig.savefig(out, dpi=160, bbox_inches="tight")
+    print(f"Saved → {out}")
+    plt.close(fig)
+
+
+# ── Plot 5: anatomical model diagram + current profile ────────────────────────
+def plot_model_diagram(p, summary=None):
+    """
+    3-panel model illustration:
+      Left   — anatomy side view (x–z): skin/fat/muscle layers, electrodes,
+               current path arrows, ROI sphere, layer conductivities
+      Middle — top view (x–y): skin surface with both electrode footprints,
+               anatomical landmarks, current spreading arc
+      Right  — |J| vs depth profile below active electrode (from simulation data
+               if available, otherwise annotated schematic). Horizontal lines
+               mark layer boundaries. Answers: "how much current at each depth?"
+
+    Output: results/model_diagram.png
+    """
+    g  = p["geometry"]
+    Lx, Ly, Lz = g["Lx"], g["Ly"], g["Lz"]
+    ls = p["layers"]
+    t_skin = ls["t_skin"]
+    t_fat  = ls.get("t_fat", ls.get("t_fat_sweep", [0.005])[1])
+    t_musc = Lz - t_skin - t_fat
+
+    pl_cfg   = p.get("placement", p.get("electrodes", {}))
+    shape    = pl_cfg.get("electrode_shape", "circle")
+    e1x, e1y = pl_cfg.get("active_xy",  [0.015, 0.045])
+    e2x, e2y = pl_cfg.get("return_xy",  [0.065, 0.045])
+    r_list   = pl_cfg.get("electrode_r_mm_list", [10])
+    r_mid_mm = r_list[len(r_list) // 2]
+    r_m      = r_mid_mm / 1000.0
+
+    ct        = p.get("contact", {})
+    t_contact = ct.get("t_contact_mm", 0.5) * 1e-3 if ct.get("enabled") else 0.0
+
+    r_cfg   = p["roi"]
+    z_tgt   = r_cfg["z_target"]
+    roi_r   = r_cfg["roi_radius"]
+    z_skin_top = Lz
+    z_nerve    = z_skin_top - z_tgt
+    z_fat_bot  = z_skin_top - t_skin - t_fat   # fat–muscle interface
+
+    c = p["conductivities"]
+
+    LAYER_COLORS = {
+        "muscle":  "#8B4513",
+        "fat":     "#D4A800",
+        "skin":    "#C68B59",
+        "contact": "#8080FF",
+    }
+    BG = "#111111"
+    TC = "white"
+
+    # ── Try to load a representative VTU for data-driven J profile ────────────
+    vtu_mesh = None
+    vtu_label = None
+    if summary:
+        t_fats = sorted(set(r["t_fat_mm"] for r in summary))
+        radii  = sorted(set(r["elec_r_mm"] for r in summary))
+        mid_t  = t_fats[len(t_fats) // 2]
+        mid_r  = radii[len(radii) // 2]
+        vtu_mesh  = load_vtu(mid_t, mid_r)
+        vtu_label = f"fat={mid_t:.0f}mm  r={mid_r:.0f}mm"
+
+    # ── Figure layout: 3 panels, left widest ─────────────────────────────────
+    fig = plt.figure(figsize=(18, 7), constrained_layout=True)
+    fig.patch.set_facecolor(BG)
+    gs = fig.add_gridspec(1, 3, width_ratios=[2.2, 1.8, 1.6])
+    ax_side = fig.add_subplot(gs[0])
+    ax_top  = fig.add_subplot(gs[1])
+    ax_prof = fig.add_subplot(gs[2])
+
+    for ax in (ax_side, ax_top, ax_prof):
+        ax.set_facecolor(BG)
+        ax.tick_params(colors=TC, labelsize=8)
+        for spine in ax.spines.values():
+            spine.set_edgecolor("#444444")
+
+    # ─── Panel 1: Side view (x–z) ─────────────────────────────────────────────
+    def _rect(ax, x0, z0, w, h, color, alpha=0.82, label=None, fs=9):
+        patch = mpatches.FancyBboxPatch(
+            (x0, z0), w, h, boxstyle="square,pad=0",
+            facecolor=color, edgecolor="white", linewidth=0.7, alpha=alpha)
+        ax.add_patch(patch)
+        if label:
+            ax.text(x0 + w/2, z0 + h/2, label, ha="center", va="center",
+                    color="white", fontsize=fs, fontweight="bold",
+                    multialignment="center")
+
+    _rect(ax_side, 0, 0,          Lx, t_musc, LAYER_COLORS["muscle"],
+          label=f"MUSCLE\nσ = {c['sigma_muscle']} S/m\n"
+                f"({t_musc*1000:.1f} mm thick)")
+    _rect(ax_side, 0, t_musc,     Lx, t_fat,  LAYER_COLORS["fat"],
+          label=f"FAT  σ={c['sigma_fat']} S/m  ({t_fat*1000:.1f}mm)", fs=8)
+    _rect(ax_side, 0, t_musc+t_fat, Lx, t_skin, LAYER_COLORS["skin"],
+          label=f"SKIN  σ={c['sigma_skin']} S/m  ({t_skin*1000:.1f}mm)", fs=7.5)
+
+    if t_contact > 0:
+        for xc in (e1x, e2x):
+            _rect(ax_side, xc - r_m, Lz, 2*r_m, t_contact,
+                  LAYER_COLORS["contact"], alpha=0.75,
+                  label=f"contact\nσ={c.get('sigma_contact_Spm', ct.get('sigma_contact_Spm', '?'))} S/m",
+                  fs=6)
+
+    # Electrodes
+    z_elec_line = Lz + t_contact + 0.0008
+    for xc, clr, lbl in [(e1x, "cyan",  "+I\nactive"),
+                          (e2x, "lime",  "0V\nreturn")]:
+        ax_side.plot([xc - r_m, xc + r_m], [z_elec_line, z_elec_line],
+                     color=clr, lw=5, solid_capstyle="butt", zorder=5)
+        ax_side.text(xc, z_elec_line + 0.0018, lbl, ha="center", va="bottom",
+                     color=clr, fontsize=8, fontweight="bold", zorder=6,
+                     multialignment="center")
+
+    # Current path arrows (active: down into tissue; return: up out)
+    ax_side.annotate("",
+        xy=(e1x - 0.003, 0.002), xytext=(e1x - 0.003, Lz),
+        arrowprops=dict(arrowstyle="-|>", color="cyan", lw=2.0,
+                        connectionstyle="arc3,rad=0.0"))
+    ax_side.annotate("",
+        xy=(e2x + 0.003, Lz), xytext=(e2x + 0.003, 0.002),
+        arrowprops=dict(arrowstyle="-|>", color="lime", lw=2.0,
+                        connectionstyle="arc3,rad=0.0"))
+    # Horizontal arc near bottom connecting the two paths
+    ax_side.annotate("",
+        xy=(e2x + 0.003, 0.004), xytext=(e1x - 0.003, 0.004),
+        arrowprops=dict(arrowstyle="-", color="white", lw=1.2,
+                        connectionstyle="arc3,rad=0.25", alpha=0.5))
+
+    # ROI
+    roi_c = plt.Circle((e1x, z_nerve), roi_r,
+                        color="yellow", fill=False, lw=2.0, ls="-",
+                        zorder=7, label=f"ROI sphere\nr={roi_r*1000:.0f}mm")
+    ax_side.add_patch(roi_c)
+    ax_side.text(e1x + roi_r + 0.001, z_nerve,
+                 f"ROI\n(tibial nerve\n≈{z_tgt*1000:.0f}mm deep)",
+                 ha="left", va="center", color="yellow", fontsize=7, zorder=8)
+
+    # Layer boundary dashes + labels on right
+    for zz, lbl in [(t_musc,         "fat | muscle"),
+                    (t_musc + t_fat,  "skin | fat"),
+                    (Lz,              "skin top")]:
+        ax_side.axhline(zz, color="white", lw=0.7, ls="--", alpha=0.4, zorder=2)
+        ax_side.text(Lx * 1.01, zz, lbl, color="white", fontsize=6.5,
+                     va="center", alpha=0.8)
+
+    ax_side.axhline(z_nerve, color="yellow", lw=1.0, ls=":", alpha=0.7, zorder=3)
+    ax_side.text(Lx * 1.01, z_nerve,
+                 f"z_nerve\n{z_nerve*1000:.0f}mm",
+                 color="yellow", fontsize=6, va="center", alpha=0.9)
+
+    ax_side.set_xlim(-0.004, Lx + 0.022)
+    ax_side.set_ylim(-0.003, Lz + t_contact + 0.010)
+    ax_side.set_xlabel("Medial → Lateral  (m)", color=TC, fontsize=9)
+    ax_side.set_ylabel("Depth z  (m,  0=base → Lz=skin top)", color=TC, fontsize=9)
+    ax_side.set_title(
+        "ANATOMY (side view, x–z plane)\n"
+        "Cyan/lime arrows = current IN / OUT of tissue",
+        color=TC, fontsize=9, fontweight="bold")
+    ax_side.legend(handles=[roi_c], loc="lower right",
+                   facecolor="#222", edgecolor="white", labelcolor="white",
+                   fontsize=7)
+
+    # ─── Panel 2: Top view (x–y, skin surface) ────────────────────────────────
+    domain = mpatches.Rectangle(
+        (0, 0), Lx, Ly,
+        facecolor=LAYER_COLORS["skin"], edgecolor="white", lw=1.0, alpha=0.35)
+    ax_top.add_patch(domain)
+    ax_top.text(Lx/2, Ly/2, "skin surface\n(z = Lz)",
+                ha="center", va="center", color="white", fontsize=8, alpha=0.5)
+
+    theta = np.linspace(0, 2*np.pi, 361)
+    for (xc, yc), clr, lbl in [
+            ((e1x, e1y), "cyan",
+             f"+I active\n({e1x*1000:.0f}, {e1y*1000:.0f}) mm"),
+            ((e2x, e2y), "lime",
+             f"0V return\n({e2x*1000:.0f}, {e2y*1000:.0f}) mm")]:
+        ax_top.fill(xc + r_m*np.cos(theta), yc + r_m*np.sin(theta),
+                    color=clr, alpha=0.25)
+        ax_top.plot(xc + r_m*np.cos(theta), yc + r_m*np.sin(theta),
+                    color=clr, lw=2.0)
+        ax_top.text(xc, yc, lbl, ha="center", va="center",
+                    color=clr, fontsize=7, fontweight="bold",
+                    multialignment="center")
+
+    # Current spreading arcs
+    for rad_mult, alpha in [(1.5, 0.5), (2.5, 0.3), (4.0, 0.15)]:
+        ax_top.plot(e1x + r_m*rad_mult*np.cos(theta),
+                    e1y + r_m*rad_mult*np.sin(theta),
+                    color="cyan", lw=0.6, ls="--", alpha=alpha)
+
+    # Arrows showing spreading
+    for ang in [0, np.pi/4, np.pi/2, 3*np.pi/4, np.pi]:
+        ax_top.annotate("",
+            xy=(e1x + r_m*3.0*np.cos(ang), e1y + r_m*3.0*np.sin(ang)),
+            xytext=(e1x + r_m*1.2*np.cos(ang), e1y + r_m*1.2*np.sin(ang)),
+            arrowprops=dict(arrowstyle="-|>", color="cyan", lw=0.8, alpha=0.4))
+
+    # Return electrode collection arcs
+    for rad_mult, alpha in [(1.5, 0.4), (2.5, 0.25)]:
+        ax_top.plot(e2x + r_m*rad_mult*np.cos(theta),
+                    e2y + r_m*rad_mult*np.sin(theta),
+                    color="lime", lw=0.6, ls="--", alpha=alpha)
+
+    # Anatomy labels
+    ax_top.text(0.003, Ly/2, "Medial\nbone", ha="left", va="center",
+                color="white", fontsize=7, alpha=0.8)
+    ax_top.text(Lx-0.003, Ly/2, "Lateral\nbone", ha="right", va="center",
+                color="white", fontsize=7, alpha=0.8)
+    ax_top.text(Lx/2, Ly-0.002, "Posterior\n(Achilles)", ha="center", va="top",
+                color="white", fontsize=7, alpha=0.8)
+    ax_top.text(Lx/2, 0.002, "Anterior", ha="center", va="bottom",
+                color="white", fontsize=7, alpha=0.8)
+
+    # Achilles tendon marker
+    ax_top.plot(Lx*0.50, Ly*0.96, '^', color='white', ms=9,
+                mfc='white', mew=1.5, zorder=5)
+    ax_top.text(Lx*0.50, Ly*0.96 - Ly*0.05, 'AT',
+                ha='center', va='top', color='white',
+                fontsize=8, fontweight='bold', zorder=5)
+
+    ax_top.set_xlim(-0.002, Lx+0.002)
+    ax_top.set_ylim(-0.002, Ly+0.002)
+    ax_top.set_aspect("equal")
+    ax_top.set_xlabel("Medial → Lateral  (m)", color=TC, fontsize=9)
+    ax_top.set_ylabel("Anterior → Posterior  (m)", color=TC, fontsize=9)
+    ax_top.set_title(
+        f"SKIN SURFACE (top view, z = {Lz*1000:.0f} mm)\n"
+        f"Dashed circles = current spreading pattern  |  r = {r_mid_mm:.0f} mm",
+        color=TC, fontsize=9, fontweight="bold")
+
+    # ─── Panel 3: |J| vs depth below active electrode ─────────────────────────
+    ax = ax_prof
+
+    depth_data     = None   # mm from skin surface
+    Jmag_data      = None
+    profile_source = "schematic"
+
+    if vtu_mesh is not None:
+        try:
+            pts  = np.array(vtu_mesh.points)
+            J    = np.array(vtu_mesh.point_data["volume current"])
+            Jmag = np.linalg.norm(J, axis=1)
+            # Points within ±r_m/2 of active electrode center in xy
+            tol_xy = max(r_m * 0.4, 0.003)
+            near   = (np.abs(pts[:, 0] - e1x) < tol_xy) & \
+                     (np.abs(pts[:, 1] - e1y) < tol_xy) & \
+                     (pts[:, 2] <= Lz + t_contact + 1e-4)
+            if near.sum() >= 4:
+                z_near     = pts[near, 2]
+                J_near     = Jmag[near]
+                depth_mm   = (Lz - z_near) * 1000   # 0 = skin top, +ve = deeper
+                # Bin into depth bins for a cleaner profile
+                bins = np.linspace(depth_mm.min(), depth_mm.max(), 60)
+                bin_idx = np.digitize(depth_mm, bins)
+                bin_J   = [J_near[bin_idx == i].mean() if (bin_idx == i).any() else np.nan
+                           for i in range(1, len(bins))]
+                bin_d   = 0.5 * (bins[:-1] + bins[1:])
+                valid   = np.isfinite(bin_J)
+                if valid.sum() >= 3:
+                    depth_data     = bin_d[valid]
+                    Jmag_data      = np.array(bin_J)[valid]
+                    profile_source = vtu_label
+        except Exception as exc:
+            print(f"  model_diagram: profile extraction failed: {exc}")
+
+    if depth_data is not None and Jmag_data is not None:
+        # Actual data profile
+        ax.plot(Jmag_data, depth_data, color="cyan", lw=2.5, zorder=5,
+                label="Simulated |J|")
+        ax.fill_betweenx(depth_data, 0, Jmag_data, color="cyan", alpha=0.18)
+        Jmax = float(Jmag_data.max()) if len(Jmag_data) > 0 else 1.0
+    else:
+        # Schematic profile (exponential-like decay as placeholder)
+        d_sch  = np.linspace(0, Lz*1000, 200)
+        J_sch  = np.exp(-d_sch / 12) * 5.0
+        ax.plot(J_sch, d_sch, color="cyan", lw=2.0, ls="--", zorder=5,
+                label="Schematic (no VTU)")
+        ax.fill_betweenx(d_sch, 0, J_sch, color="cyan", alpha=0.12)
+        Jmax = 5.5
+        depth_data = d_sch
+
+    ax.set_ylim(depth_data.max() + 1, -1)   # depth increases downward
+
+    # Layer shading
+    def _layer_band(ax, d0_mm, d1_mm, color, label):
+        ax.axhspan(d0_mm, d1_mm, color=color, alpha=0.22, zorder=1)
+        ax.text(Jmax * 1.02, (d0_mm + d1_mm) / 2, label,
+                ha="left", va="center", color=color, fontsize=7.5,
+                fontweight="bold")
+
+    if t_contact > 0:
+        _layer_band(ax, -t_contact*1000, 0, LAYER_COLORS["contact"], "contact")
+    _layer_band(ax, 0,                t_skin*1000,           LAYER_COLORS["skin"],   "SKIN")
+    _layer_band(ax, t_skin*1000,      (t_skin+t_fat)*1000,   LAYER_COLORS["fat"],    "FAT")
+    _layer_band(ax, (t_skin+t_fat)*1000, Lz*1000,            LAYER_COLORS["muscle"], "MUSCLE")
+
+    # Layer boundary lines
+    for d_mm, lbl in [(0,                    "skin surface"),
+                      (t_skin*1000,           "skin|fat"),
+                      ((t_skin+t_fat)*1000,   "fat|muscle")]:
+        ax.axhline(d_mm, color="white", lw=0.8, ls="--", alpha=0.5, zorder=3)
+        ax.text(0, d_mm - 0.3, lbl, color="white", fontsize=6.0,
+                va="bottom", ha="left", alpha=0.7)
+
+    # ROI depth
+    roi_depth_mm = z_tgt * 1000
+    ax.axhline(roi_depth_mm, color="yellow", lw=1.5, ls="-.", alpha=0.85, zorder=4)
+    ax.text(0, roi_depth_mm + 0.4,
+            f"ROI (nerve)\n{roi_depth_mm:.0f} mm",
+            color="yellow", fontsize=7, va="top", ha="left")
+
+    # Annotate layer-average J if data available
+    if depth_data is not None and Jmag_data is not None:
+        def _layer_avg(d0, d1):
+            m = (depth_data >= d0) & (depth_data < d1)
+            return float(Jmag_data[m].mean()) if m.any() else np.nan
+
+        for d0, d1, lname, clr in [
+                (0,                  t_skin*1000,          "Skin",   LAYER_COLORS["skin"]),
+                (t_skin*1000,        (t_skin+t_fat)*1000,  "Fat",    LAYER_COLORS["fat"]),
+                ((t_skin+t_fat)*1000, Lz*1000,             "Muscle", LAYER_COLORS["muscle"])]:
+            jav = _layer_avg(d0, d1)
+            if np.isfinite(jav):
+                dmid = (d0 + d1) / 2
+                ax.annotate(f"avg={jav:.3f}\nA/m²",
+                            xy=(jav, dmid),
+                            xytext=(Jmax * 0.55, dmid),
+                            fontsize=7, color=clr, ha="center", va="center",
+                            arrowprops=dict(arrowstyle="->", color=clr,
+                                           lw=0.7, alpha=0.6))
+
+    ax.set_xlabel("|J|  (A/m²)", color=TC, fontsize=9)
+    ax.set_ylabel("Depth below skin surface  (mm)", color=TC, fontsize=9)
+    ax.set_title(
+        f"|J| vs depth below active electrode\n"
+        f"({profile_source if profile_source != 'schematic' else 'schematic — run sweep first'})",
+        color=TC, fontsize=8.5, fontweight="bold")
+    ax.legend(facecolor="#222", edgecolor="white", labelcolor="white", fontsize=8,
+              loc="lower right")
+    ax.set_xlim(left=0)
+
+    fig.suptitle(
+        "MODEL OVERVIEW — ankle 3-layer slab PTNS stimulation  "
+        "(PLACEHOLDER conductivities — not validated)\n"
+        f"Geometry: {Lx*100:.0f}×{Ly*100:.0f}×{Lz*100:.0f} cm  |  "
+        f"skin {t_skin*1000:.1f}mm  fat {t_fat*1000:.1f}mm  "
+        f"muscle {t_musc*1000:.1f}mm  |  "
+        f"Active: ({e1x*1000:.0f},{e1y*1000:.0f})mm  "
+        f"Return: ({e2x*1000:.0f},{e2y*1000:.0f})mm  r={r_mid_mm:.0f}mm",
+        fontsize=9.5, fontweight="bold", color=TC)
+
+    out = RESULTS_DIR / "model_diagram.png"
+    fig.savefig(out, dpi=160, bbox_inches="tight", facecolor=BG)
+    print(f"Saved → {out}")
+    plt.close(fig)
+
+
 # ── Sanity check table ────────────────────────────────────────────────────────
-def print_sanity_table(summary):
-    """Print a compact per-case verification table to the console."""
+def print_sanity_table(summary, p=None):
+    """Print a comprehensive per-case verification table to the console."""
     if not summary:
         return
     mode = summary[0].get("control_mode", "voltage")
-    print(f"\n{'='*80}")
-    print("  RESULTS SANITY CHECK")
-    print(f"{'='*80}")
+    st   = (p.get("stim", p.get("control", {})) if p else {})
+    I_target_mA = st.get("injected_current_mA", 5.0) if mode == "current" else None
+
+    width = 120 if mode == "current" else 100
+    print(f"\n{'='*width}")
+    print("  RESULTS SANITY CHECK — per-case current delivery & ROI")
+    print(f"{'='*width}")
+
+    # Header
     hdr = (f"  {'r(mm)':>6}  {'fat(mm)':>7}  "
-           f"{'I_active(mA)':>13}  {'I_return(mA)':>13}  {'flux_err(%)':>11}")
+           f"{'I_active(mA)':>13}  {'I_return(mA)':>13}  {'flux_err%':>10}")
     if mode == "current":
-        hdr += f"  {'compliance_V':>13}"
+        hdr += f"  {'tgt(mA)':>8}  {'dev%':>6}  {'compV':>8}"
+    hdr += (f"  {'BC_act':>6}  {'BC_ret':>6}"
+            f"  {'roi_layer':>9}  {'frac_mu':>8}  {'frac_fa':>8}  {'frac_sk':>8}")
     print(hdr)
     print("  " + "-" * (len(hdr) - 2))
+
     for row in sorted(summary, key=lambda x: (x["elec_r_mm"], x["t_fat_mm"])):
         I_a = row.get("total_current_A", float("nan"))
         I_r = row.get("I_return_A",      float("nan"))
         fe  = row.get("flux_err",        float("nan"))
+        fm  = row.get("roi_frac_muscle", float("nan"))
+        ff  = row.get("roi_frac_fat",    float("nan"))
+        fs  = row.get("roi_frac_skin",   float("nan"))
+        rl  = row.get("roi_layer",       "?")
+
+        def _fmt(v, fmt):
+            return fmt.format(v) if (v is not None and np.isfinite(float(v))) else "    N/A"
+
         line = (f"  {row['elec_r_mm']:>6.0f}  {row['t_fat_mm']:>7.1f}  "
-                f"{I_a*1e3:>13.3f}  {I_r*1e3:>13.3f}  {fe*100:>10.2f}%")
-        if mode == "current":
+                f"{_fmt(I_a*1e3 if np.isfinite(float(I_a)) else float('nan'), '{:>13.3f}'):>13}  "
+                f"{_fmt(I_r*1e3 if np.isfinite(float(I_r)) else float('nan'), '{:>13.3f}'):>13}  "
+                f"{_fmt(fe*100  if np.isfinite(float(fe))  else float('nan'), '{:>10.2f}'):>10}")
+        if mode == "current" and I_target_mA is not None:
+            dev = (abs(float(I_a) - I_target_mA * 1e-3) / (I_target_mA * 1e-3) * 100
+                   if np.isfinite(float(I_a)) else float("nan"))
             cV = row.get("compliance_V", float("nan"))
             ec = row.get("exceeded_compliance", False)
-            line += f"  {cV:>12.2f}V" + ("  [!]" if ec else "")
+            line += (f"  {I_target_mA:>8.1f}"
+                     f"  {_fmt(dev, '{:>6.2f}'):>6}"
+                     f"  {_fmt(cV, '{:>8.2f}'):>8}"
+                     + ("  [!]" if ec else ""))
+        bc_a = row.get("active_boundary_id_used")
+        bc_r = row.get("return_boundary_id_used")
+        line += (f"  {str(bc_a) if bc_a is not None else 'N/A':>6}"
+                 f"  {str(bc_r) if bc_r is not None else 'N/A':>6}"
+                 f"  {rl:>9}"
+                 f"  {_fmt(fm, '{:>8.4f}'):>8}"
+                 f"  {_fmt(ff, '{:>8.4f}'):>8}"
+                 f"  {_fmt(fs, '{:>8.4f}'):>8}")
         print(line)
-    print(f"{'='*80}\n")
+
+    if mode == "current" and I_target_mA is not None:
+        print(f"\n  Target current: {I_target_mA:.1f} mA  |  dev% = |I_active - target| / target × 100")
+        print(f"  BC_act/ret = Elmer boundary IDs used for active/return electrode")
+        print(f"  frac_mu/fa/sk = fraction of ROI cells in muscle / fat / skin")
+    print(f"{'='*width}\n")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -572,5 +1161,7 @@ if __name__ == "__main__":
     plot_J_surface_maps(summary, p)
     plot_summary_metrics(summary, p)
     plot_3d_representative(summary, p)
-    print_sanity_table(summary)
+    plot_depth_slice_E_maps(summary, p)
+    plot_model_diagram(p, summary=summary)
+    print_sanity_table(summary, p)
     print("Done.")
