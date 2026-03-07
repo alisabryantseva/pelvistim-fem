@@ -892,11 +892,13 @@ def plot_model_diagram(p, summary=None):
                    fontsize=7)
 
     # ─── Panel 2: Top view (x–y, skin surface) ────────────────────────────────
-    domain = mpatches.Rectangle(
-        (0, 0), Lx, Ly,
-        facecolor=LAYER_COLORS["skin"], edgecolor="white", lw=1.0, alpha=0.35)
-    ax_top.add_patch(domain)
-    ax_top.text(Lx/2, Ly/2, "skin surface\n(z = Lz)",
+    # Draw actual ankle polygon (same 12-point outline used in FEM mesh)
+    ankle_pts = ankle_outline_pts(Lx, Ly)
+    ankle_poly = mpatches.Polygon(
+        ankle_pts, closed=True,
+        facecolor=LAYER_COLORS["skin"], edgecolor="white", lw=2.0, alpha=0.35)
+    ax_top.add_patch(ankle_poly)
+    ax_top.text(Lx/2, Ly*0.40, "skin surface\n(z = Lz)",
                 ha="center", va="center", color="white", fontsize=8, alpha=0.5)
 
     theta = np.linspace(0, 2*np.pi, 361)
