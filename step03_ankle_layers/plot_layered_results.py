@@ -123,8 +123,9 @@ def plot_J_surface_maps(summary, p):
             continue
         pts  = np.array(m.points)
         Jmag = np.linalg.norm(np.array(m.point_data["volume current"]), axis=1)
-        # Skin surface is at z ≈ Lz regardless of contact layer (contact sits above it)
-        mask = (pts[:, 2] > Lz * 0.99) & (pts[:, 2] < Lz * 1.02)
+        # Skin surface: top 20% of skin layer depth (handles uneven top surface)
+        _t_skin = p["layers"]["t_skin"]
+        mask = pts[:, 2] > (Lz - _t_skin) + _t_skin * 0.80
         all_J.extend(Jmag[mask].tolist())
         meshes[(row["t_fat_mm"], row["elec_r_mm"])] = (pts, Jmag, mask)
 
@@ -503,8 +504,10 @@ def plot_3d_representative(summary, p):
 
     # Extract top skin surface (z ≈ Lz); contact layer is slightly above, skin at Lz
     surf = m.extract_surface()
-    cc_z = np.array(surf.cell_centers().points)[:, 2]
-    top_ids = np.where((cc_z > Lz * 0.97) & (cc_z < Lz * 1.05))[0]
+    cc_z    = np.array(surf.cell_centers().points)[:, 2]
+    _t_skin = p["layers"]["t_skin"]
+    _z0_sk  = Lz - _t_skin
+    top_ids = np.where(cc_z > _z0_sk + _t_skin * 0.80)[0]
     skin_surf = surf.extract_cells(top_ids) if len(top_ids) > 10 else surf
 
     # Electrode outline polylines (circles or squares) at z = Lz + small offset

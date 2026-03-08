@@ -90,6 +90,34 @@ def ankle_outline_pts(Lx, Ly):
     return [(fx * Lx, fy * Ly) for fx, fy in frac]
 
 
+def _ankle_z_top(x, y, Lx, Ly, Lz):
+    """
+    Anatomical skin surface height z_top(x, y) for the ankle.
+    Nominal height = Lz (flat baseline) plus smooth Gaussian bumps/dips:
+
+      Medial groove  (P10, low x, mid y) : −4 mm  ← active electrode sits here
+      Achilles       (P7,  mid x, high y): +3 mm  ← Achilles tendon protrudes
+      Lateral malle. (P4,  high x, mid y): +2 mm  ← bony prominence
+    """
+    xn = x / Lx   # 0 = medial, 1 = lateral
+    yn = y / Ly   # 0 = anterior, 1 = posterior
+    h  = Lz
+
+    # Medial groove: 4 mm dip at P10 (0.02, 0.47)
+    r2 = ((xn - 0.02) / 0.12)**2 + ((yn - 0.47) / 0.18)**2
+    h -= 0.004 * np.exp(-r2)
+
+    # Achilles tendon: 3 mm bump at P7 (0.50, 0.97)
+    r2 = ((xn - 0.50) / 0.18)**2 + ((yn - 0.97) / 0.07)**2
+    h += 0.003 * np.exp(-r2)
+
+    # Lateral malleolus: 2 mm bump at P4 (0.97, 0.47)
+    r2 = ((xn - 0.97) / 0.07)**2 + ((yn - 0.47) / 0.18)**2
+    h += 0.002 * np.exp(-r2)
+
+    return float(h)
+
+
 # ── 1b. Build gmsh mesh ────────────────────────────────────────────────────────
 def build_mesh(p, t_fat, elec_r, run_dir, coarse=False):
     """
@@ -143,9 +171,14 @@ def build_mesh(p, t_fat, elec_r, run_dir, coarse=False):
     z0_fat     = t_muscle
     z0_skin    = t_muscle + t_fat
     z_skin_top = Lz
-    z_elec_top = Lz + t_contact if contact_enabled else Lz
+    cross      = g.get("cross_section", "rect")
 
-    cross = g.get("cross_section", "rect")
+    # Per-electrode skin surface z (anatomical bumps/grooves for ankle cross-section)
+    z_e1_skin     = _ankle_z_top(e1x, e1y, Lx, Ly, Lz) if cross == "ankle" else Lz
+    z_e2_skin     = _ankle_z_top(e2x, e2y, Lx, Ly, Lz) if cross == "ankle" else Lz
+    z_e1_elec_top = z_e1_skin + t_contact
+    z_e2_elec_top = z_e2_skin + t_contact
+    z_elec_top    = max(z_e1_elec_top, z_e2_elec_top)  # conservative max for BC search
 
     gmsh.initialize()
     gmsh.option.setNumber("General.Terminal", 0)
@@ -187,9 +220,9 @@ def build_mesh(p, t_fat, elec_r, run_dir, coarse=False):
             result = gmsh.model.occ.extrude([(2, base)], 0, 0, height)
             return next(dt[1] for dt in result if dt[0] == 3)
 
-        vol_c1 = _contact_vol(e1x, e1y, z_skin_top, t_contact,
+        vol_c1 = _contact_vol(e1x, e1y, z_e1_skin, t_contact,
                               elec_r, shape, lc_elec)
-        vol_c2 = _contact_vol(e2x, e2y, z_skin_top, t_contact,
+        vol_c2 = _contact_vol(e2x, e2y, z_e2_skin, t_contact,
                               elec_r, shape, lc_elec)
         all_vols += [(3, vol_c1), (3, vol_c2)]
 
@@ -232,14 +265,15 @@ def build_mesh(p, t_fat, elec_r, run_dir, coarse=False):
         b = gmsh.model.getBoundingBox(dim, tag)
         return (b[2] + b[5]) / 2.0
 
-    tol_z    = max(z_elec_top * 5e-3, 1e-5)
-    top_surfs = [dt for dt in surfs
-                 if abs(_surf_z_mid(*dt) - z_elec_top) < tol_z]
+    # Accept surfaces at or near either electrode's top z (handles uneven surface)
+    z_min_elec = min(z_e1_elec_top, z_e2_elec_top)
+    tol_z      = max(z_elec_top * 2e-2, 1e-4)
+    top_surfs  = [dt for dt in surfs
+                  if _surf_z_mid(*dt) >= z_min_elec - tol_z]
 
     if not top_surfs:
-        # Fall back: find surfaces closest to z_elec_top
-        top_surfs = sorted(surfs,
-                           key=lambda dt: abs(_surf_z_mid(*dt) - z_elec_top))[:4]
+        # Fall back: surfaces with highest z centroids
+        top_surfs = sorted(surfs, key=lambda dt: -_surf_z_mid(*dt))[:4]
 
     e1_pos2d = np.array([e1x, e1y])
     e2_pos2d = np.array([e2x, e2y])
@@ -248,10 +282,18 @@ def build_mesh(p, t_fat, elec_r, run_dir, coarse=False):
         b = gmsh.model.getBoundingBox(dim, tag)
         return np.array([(b[0]+b[3])/2, (b[1]+b[4])/2])
 
-    e1_s = min(top_surfs,
-               key=lambda dt: np.linalg.norm(_surf_xy_cen(*dt) - e1_pos2d))
-    e2_s = min([s for s in top_surfs if s != e1_s],
-               key=lambda dt: np.linalg.norm(_surf_xy_cen(*dt) - e2_pos2d))
+    def _pick_elec_surf(candidates, pos2d, r_xy):
+        """Surfaces near pos2d within r_xy; pick the one with the highest z centroid.
+        Multiple surfaces can share the same xy centroid (e.g. contact top vs
+        skin-contact interface), so we break ties by z rather than xy distance."""
+        near = [dt for dt in candidates
+                if np.linalg.norm(_surf_xy_cen(*dt) - pos2d) < r_xy]
+        pool = near if near else candidates
+        return max(pool, key=lambda dt: _surf_z_mid(*dt))
+
+    e1_s = _pick_elec_surf(top_surfs, e1_pos2d, elec_r * 2)
+    e2_s = _pick_elec_surf([s for s in top_surfs if s != e1_s],
+                           e2_pos2d, elec_r * 2)
     other_s = [dt for dt in surfs if dt not in (e1_s, e2_s)]
 
     # ── Physical groups ───────────────────────────────────────────────────────
@@ -279,6 +321,24 @@ def build_mesh(p, t_fat, elec_r, run_dir, coarse=False):
     gmsh.option.setNumber("Mesh.CharacteristicLengthMin", lc_min)
 
     gmsh.model.mesh.generate(3)
+
+    # ── Anatomical surface deformation (ankle cross-section only) ─────────────
+    # Deform skin layer nodes so the top surface follows _ankle_z_top(x,y).
+    # Flat mesh topology is preserved; only z-coordinates change.
+    # Skin bottom (z = z0_skin) stays fixed; skin top nodes move to z_top(x,y).
+    if cross == "ankle":
+        ntags, ncoords, _ = gmsh.model.mesh.getNodes()
+        coords = ncoords.reshape(-1, 3).copy()
+        for i in range(len(ntags)):
+            x, y, z = coords[i]
+            if z > z0_skin - 1e-6:          # node in skin layer (or contact above)
+                t = (z - z0_skin) / t_skin  # 0 at skin bottom, 1 at skin top
+                t = max(0.0, min(1.0, t))
+                z_target = _ankle_z_top(x, y, Lx, Ly, Lz)
+                coords[i, 2] = z + (z_target - Lz) * t
+        for i, tag in enumerate(ntags):
+            gmsh.model.mesh.setNode(int(tag), coords[i].tolist(), [])
+
     msh = run_dir / "mesh.msh"
     gmsh.write(str(msh))
     n_nodes = len(gmsh.model.mesh.getNodes()[0])
@@ -286,21 +346,26 @@ def build_mesh(p, t_fat, elec_r, run_dir, coarse=False):
 
     body_info = {
         "contact_enabled": contact_enabled,
-        "z_skin_top":      z_skin_top,
-        "z_elec_top":      z_elec_top,
+        "z_skin_top":      z_skin_top,       # nominal flat skin bottom (= Lz)
+        "z_elec_top":      z_elec_top,       # conservative max for fallback logic
+        "z_e1_skin":       z_e1_skin,        # skin surface z at active electrode
+        "z_e2_skin":       z_e2_skin,        # skin surface z at return electrode
+        "z_e1_elec_top":   z_e1_elec_top,    # electrode top z at active site
+        "z_e2_elec_top":   z_e2_elec_top,    # electrode top z at return site
         "c1_body_id":      c1_body_id,
         "c2_body_id":      c2_body_id,
         "elec_shape":      shape,
     }
     return (n_nodes,
-            np.array([e1x, e1y, z_elec_top]),
-            np.array([e2x, e2y, z_elec_top]),
+            np.array([e1x, e1y, z_e1_elec_top]),
+            np.array([e2x, e2y, z_e2_elec_top]),
             body_info)
 
 
 # ── 2. Detect Elmer boundary IDs for the two electrodes ──────────────────────
-def detect_elec_bc_ids(elmer_mesh_dir, e1_pos, e2_pos, z_elec_top):
-    """Scan mesh.nodes + mesh.boundary to find the BC IDs nearest to each electrode."""
+def detect_elec_bc_ids(elmer_mesh_dir, e1_pos, e2_pos, z_e1_top, z_e2_top):
+    """Scan mesh.nodes + mesh.boundary to find the BC IDs nearest to each electrode.
+    z_e1_top / z_e2_top: expected z of each electrode's top surface (may differ for uneven geometry)."""
     nodes = {}
     with open(elmer_mesh_dir / "mesh.nodes") as f:
         for line in f:
@@ -314,10 +379,9 @@ def detect_elec_bc_ids(elmer_mesh_dir, e1_pos, e2_pos, z_elec_top):
             except ValueError:
                 continue
 
-    # Determine actual z_max from nodes (handles both with/without contact)
-    all_z = np.array([v[2] for v in nodes.values()])
-    z_max = float(all_z.max())
-    tol_z = max(z_max * 5e-3, 1e-5)
+    # Wide floor filter: keep any BC element above the skin-fat interface level.
+    # Per-electrode z matching happens when selecting e1_id / e2_id below.
+    z_floor = min(z_e1_top, z_e2_top) - 5e-3   # 5 mm below lowest electrode top
 
     def _elem_area(nids):
         """Geometric area of a triangular or quad boundary element."""
@@ -332,8 +396,9 @@ def detect_elec_bc_ids(elmer_mesh_dir, e1_pos, e2_pos, z_elec_top):
         return a
 
     etype_nn = {202: 2, 303: 3, 306: 6, 404: 4}
-    bc_centers  = {}
-    bc_elem_nids = {}   # bcid -> list of nid lists, for area computation
+    bc_centers   = {}    # bcid -> list of xy centroids
+    bc_z_centers = {}    # bcid -> list of z centroids
+    bc_elem_nids = {}    # bcid -> list of nid lists, for area computation
     with open(elmer_mesh_dir / "mesh.boundary") as f:
         for line in f:
             parts = line.split()
@@ -353,22 +418,36 @@ def detect_elec_bc_ids(elmer_mesh_dir, e1_pos, e2_pos, z_elec_top):
             if len(coords) < 2:
                 continue
             zvals = [c[2] for c in coords]
-            if min(zvals) < z_max - tol_z:
+            if max(zvals) < z_floor:
                 continue
             cxy = np.mean([c[:2] for c in coords], axis=0)
+            cz  = float(np.mean(zvals))
             bc_centers.setdefault(bcid, []).append(cxy)
+            bc_z_centers.setdefault(bcid, []).append(cz)
             bc_elem_nids.setdefault(bcid, []).append(nids)
 
-    bc_mean = {bid: np.mean(pts, axis=0)
-               for bid, pts in bc_centers.items() if pts}
+    bc_mean   = {bid: np.mean(pts, axis=0) for bid, pts in bc_centers.items() if pts}
+    bc_z_mean = {bid: float(np.mean(zs))   for bid, zs  in bc_z_centers.items() if zs}
     if len(bc_mean) < 2:
         raise RuntimeError(
             f"Expected ≥2 top-face BCs, found: {list(bc_mean.keys())}")
 
-    e1_id = min(bc_mean,
-                key=lambda b: np.linalg.norm(bc_mean[b] - e1_pos[:2]))
-    e2_id = min(bc_mean,
-                key=lambda b: np.linalg.norm(bc_mean[b] - e2_pos[:2]))
+    # For each electrode, pick the BC whose (xy centroid, z centroid) best matches
+    # the electrode's expected position.  Weight z-mismatch heavily so the contact
+    # top face is preferred over the skin-contact interface below it.
+    def _find_elec_bc(pos_e, z_e_top, exclude=None):
+        tol_z_e = max(z_e_top * 2e-2, 5e-4)
+        # 1st pass: BCs within z tolerance of expected electrode top
+        candidates = {bid: cxy for bid, cxy in bc_mean.items()
+                      if bid != exclude
+                      and abs(bc_z_mean.get(bid, 0) - z_e_top) < tol_z_e}
+        if not candidates:
+            # Fallback: all BCs (skip only excluded)
+            candidates = {bid: cxy for bid, cxy in bc_mean.items() if bid != exclude}
+        return min(candidates, key=lambda b: np.linalg.norm(candidates[b] - pos_e[:2]))
+
+    e1_id = _find_elec_bc(e1_pos, z_e1_top)
+    e2_id = _find_elec_bc(e2_pos, z_e2_top, exclude=e1_id)
 
     e1_area = sum(_elem_area(nids) for nids in bc_elem_nids.get(e1_id, []))
     e2_area = sum(_elem_area(nids) for nids in bc_elem_nids.get(e2_id, []))
@@ -608,8 +687,11 @@ def save_bc_debug_report(run_dir, label, e1_id, e2_id, A_active_mesh,
     lines += [
         "",
         f"  contact_enabled  : {contact}",
-        f"  z_skin_top       : {body_info['z_skin_top']*1000:.2f} mm",
-        f"  z_elec_top       : {body_info['z_elec_top']*1000:.2f} mm",
+        f"  z_skin_top (nom) : {body_info['z_skin_top']*1000:.2f} mm",
+        f"  z_e1_skin        : {body_info.get('z_e1_skin', body_info['z_skin_top'])*1000:.2f} mm  (active electrode skin surface)",
+        f"  z_e2_skin        : {body_info.get('z_e2_skin', body_info['z_skin_top'])*1000:.2f} mm  (return electrode skin surface)",
+        f"  z_e1_elec_top    : {body_info.get('z_e1_elec_top', body_info['z_elec_top'])*1000:.2f} mm",
+        f"  z_e2_elec_top    : {body_info.get('z_e2_elec_top', body_info['z_elec_top'])*1000:.2f} mm",
     ]
 
     report = "\n".join(lines) + "\n"
@@ -619,24 +701,16 @@ def save_bc_debug_report(run_dir, label, e1_id, e2_id, A_active_mesh,
 
 
 # ── 5a. Surface flux integral (electrode current) ──────────────────────────────
-def compute_injected_current(mesh, e1_pos3d, e2_pos3d, elec_r, z_elec_top,
+def compute_injected_current(mesh, e1_pos3d, e2_pos3d, elec_r,
+                             z_e1_elec_top, z_e2_elec_top,
                              elec_shape="circle"):
     """
-    Integrate J·n_outward over each electrode patch at z ≈ z_elec_top.
-    n_outward = +z at top face; J_z < 0 means current enters tissue.
-
-    FIX: Uses only embedded 2D boundary cells (VTK type 5=triangle, 9=quad)
-    from the VTU, NOT extract_surface(). extract_surface() on a mixed-dimension
-    VTU (3D tets + 2D boundary triangles) double-counts each boundary face:
-    once as the standalone 2D triangle cell AND once as the external face of
-    the adjacent tet — causing ~2× overestimate of injected current.
-
-    elec_shape: "circle" — distance < elec_r*(1+0.2)
-                "square" — |dx| < elec_r*(1+0.2)  and  |dy| < elec_r*(1+0.2)
+    Integrate J·n_outward over each electrode patch.
+    Uses per-electrode z heights to handle uneven skin surface.
+    Uses only embedded 2D boundary cells (VTK type 5/9) to avoid double-counting.
 
     Returns: (I_active_abs, I_return_abs, flux_err, I_active_signed, I_return_signed)
     """
-    tol_z     = max(z_elec_top * 5e-3, 1e-5)
     tolerance = 0.2
 
     # Extract only 2D boundary cells to avoid double-counting
@@ -657,20 +731,20 @@ def compute_injected_current(mesh, e1_pos3d, e2_pos3d, elec_r, z_elec_top,
     sizes = bnd_mesh.compute_cell_sizes()
     areas = np.array(sizes.cell_data["Area"])
 
-    top_mask = cell_pts[:, 2] > z_elec_top - tol_z
-
-    def _mask(pos3d):
+    def _mask(pos3d, z_top):
+        tol_z  = max(z_top * 5e-3, 1e-5)
+        top_m  = cell_pts[:, 2] > z_top - tol_z
         dx = cell_pts[:, 0] - pos3d[0]
         dy = cell_pts[:, 1] - pos3d[1]
         if elec_shape == "square":
-            return (top_mask
+            return (top_m
                     & (np.abs(dx) < elec_r * (1 + tolerance))
                     & (np.abs(dy) < elec_r * (1 + tolerance)))
         else:
-            return top_mask & (np.sqrt(dx**2 + dy**2) < elec_r * (1 + tolerance))
+            return top_m & (np.sqrt(dx**2 + dy**2) < elec_r * (1 + tolerance))
 
-    active_mask = _mask(e1_pos3d)
-    return_mask = _mask(e2_pos3d)
+    active_mask = _mask(e1_pos3d, z_e1_elec_top)
+    return_mask = _mask(e2_pos3d, z_e2_elec_top)
 
     if not active_mask.any() or not return_mask.any():
         return np.nan, np.nan, np.nan, np.nan, np.nan
@@ -764,13 +838,16 @@ def extract_results(run_dir, p, t_fat, elec_r, e1_pos3d, e2_pos3d,
 
     g  = p["geometry"]
     Lx, Ly, Lz = g["Lx"], g["Ly"], g["Lz"]
-    z_skin_top = body_info["z_skin_top"]
-    z_elec_top = body_info["z_elec_top"]
-    elec_shape = body_info.get("elec_shape", "circle")
-    tol_z      = max(z_skin_top * 5e-3, 1e-5)
+    z_skin_top    = body_info["z_skin_top"]
+    z_elec_top    = body_info["z_elec_top"]
+    z_e1_elec_top = body_info.get("z_e1_elec_top", z_elec_top)
+    z_e2_elec_top = body_info.get("z_e2_elec_top", z_elec_top)
+    elec_shape    = body_info.get("elec_shape", "circle")
+    ls_p          = p["layers"]
+    z0_skin       = z_skin_top - ls_p["t_skin"]  # flat skin-fat interface
 
-    # ── Peak |J| at skin surface (z ≈ z_skin_top) ────────────────────────────
-    skin_mask = pts[:, 2] > z_skin_top - tol_z
+    # ── Peak |J| at skin surface (top 20% of skin layer; handles uneven top) ─
+    skin_mask = pts[:, 2] > z0_skin + ls_p["t_skin"] * 0.80
 
     # with-electrode: include electrode footprint
     peak_J_skin_with = float(Jmag[skin_mask].max()) if skin_mask.any() else np.nan
@@ -796,7 +873,8 @@ def extract_results(run_dir, p, t_fat, elec_r, e1_pos3d, e2_pos3d,
     # ── Total injected current ────────────────────────────────────────────────
     (I_active, I_return, flux_err,
      I_active_signed, I_return_signed) = compute_injected_current(
-        mesh, e1_pos3d, e2_pos3d, elec_r, z_elec_top, elec_shape)
+        mesh, e1_pos3d, e2_pos3d, elec_r,
+        z_e1_elec_top, z_e2_elec_top, elec_shape)
     print(f"    I_active={I_active:.4e} A  "
           f"I_return={I_return:.4e} A  "
           f"flux_err={flux_err:.2e}")
@@ -818,10 +896,9 @@ def extract_results(run_dir, p, t_fat, elec_r, e1_pos3d, e2_pos3d,
     compliance_V = np.nan
     exceeded_compliance = False
     if mode == "current":
-        tol_z_e = max(z_elec_top * 5e-3, 1e-5)
-
-        def _node_mask_elec(pos3d):
-            m = pts[:, 2] > z_elec_top - tol_z_e
+        def _node_mask_elec(pos3d, z_et):
+            tol_z_e = max(z_et * 5e-3, 1e-5)
+            m = pts[:, 2] > z_et - tol_z_e
             if elec_shape == "circle":
                 m &= (np.sqrt((pts[:, 0] - pos3d[0])**2
                               + (pts[:, 1] - pos3d[1])**2) < elec_r * 1.5)
@@ -830,8 +907,8 @@ def extract_results(run_dir, p, t_fat, elec_r, e1_pos3d, e2_pos3d,
                       & (np.abs(pts[:, 1] - pos3d[1]) < elec_r * 1.5))
             return m
 
-        active_mask_n = _node_mask_elec(e1_pos3d)
-        return_mask_n = _node_mask_elec(e2_pos3d)
+        active_mask_n = _node_mask_elec(e1_pos3d, z_e1_elec_top)
+        return_mask_n = _node_mask_elec(e2_pos3d, z_e2_elec_top)
 
         phi_key = next((k for k in ("Potential", "potential")
                         if k in mesh.point_data), None)
@@ -1002,7 +1079,7 @@ def run_sweep(p, t_fat_list, elec_r_list, coarse=False, sigma_skin_override=None
 
             print("  detecting electrode BCs + computing mesh areas ...")
             e1_id, e2_id, A_active_mesh, A_return_mesh = detect_elec_bc_ids(
-                elmer_dir, e1_pos, e2_pos, body_info["z_elec_top"])
+                elmer_dir, e1_pos, e2_pos, e1_pos[2], e2_pos[2])
             area_analytic = (np.pi * elec_r**2 if pl.get("electrode_shape",
                              pl.get("shape", "circle")) == "circle"
                              else (2 * elec_r)**2)

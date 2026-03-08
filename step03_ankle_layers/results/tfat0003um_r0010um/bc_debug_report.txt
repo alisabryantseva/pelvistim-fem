@@ -21,5 +21,8 @@ BC DEBUG REPORT — tfat0003um_r0010um
   Return electrode is Dirichlet: Potential = 0.
 
   contact_enabled  : True
-  z_skin_top       : 40.00 mm
-  z_elec_top       : 40.50 mm
+  z_skin_top (nom) : 40.00 mm
+  z_e1_skin        : 40.00 mm  (active electrode skin surface)
+  z_e2_skin        : 40.00 mm  (return electrode skin surface)
+  z_e1_elec_top    : 40.50 mm
+  z_e2_elec_top    : 40.50 mm
