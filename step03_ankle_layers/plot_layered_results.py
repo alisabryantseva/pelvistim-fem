@@ -801,15 +801,16 @@ def plot_model_diagram(p, summary=None):
         vtu_mesh  = load_vtu(mid_t, mid_r)
         vtu_label = f"fat={mid_t:.0f}mm  r={mid_r:.0f}mm"
 
-    # ── Figure layout: 3 panels, left widest ─────────────────────────────────
-    fig = plt.figure(figsize=(18, 7), constrained_layout=True)
+    # ── Figure layout: 4 panels ───────────────────────────────────────────────
+    fig = plt.figure(figsize=(26, 7), constrained_layout=True)
     fig.patch.set_facecolor(BG)
-    gs = fig.add_gridspec(1, 3, width_ratios=[2.2, 1.8, 1.6])
+    gs = fig.add_gridspec(1, 4, width_ratios=[2.2, 1.8, 1.6, 2.0])
     ax_side = fig.add_subplot(gs[0])
     ax_top  = fig.add_subplot(gs[1])
     ax_prof = fig.add_subplot(gs[2])
+    ax_3d   = fig.add_subplot(gs[3])
 
-    for ax in (ax_side, ax_top, ax_prof):
+    for ax in (ax_side, ax_top, ax_prof, ax_3d):
         ax.set_facecolor(BG)
         ax.tick_params(colors=TC, labelsize=8)
         for spine in ax.spines.values():
@@ -901,13 +902,11 @@ def plot_model_diagram(p, summary=None):
                    fontsize=7)
 
     # ─── Panel 2: Top view (x–y, skin surface) ────────────────────────────────
-    # Draw actual ankle polygon (same 12-point outline used in FEM mesh)
-    ankle_pts = ankle_outline_pts(Lx, Ly)
-    ankle_poly = mpatches.Polygon(
-        ankle_pts, closed=True,
-        facecolor=LAYER_COLORS["skin"], edgecolor="white", lw=2.0, alpha=0.35)
-    ax_top.add_patch(ankle_poly)
-    ax_top.text(Lx/2, Ly*0.40, "skin surface\n(z = Lz)",
+    domain = mpatches.Rectangle(
+        (0, 0), Lx, Ly,
+        facecolor=LAYER_COLORS["skin"], edgecolor="white", lw=1.0, alpha=0.35)
+    ax_top.add_patch(domain)
+    ax_top.text(Lx/2, Ly/2, "skin surface\n(z = Lz)",
                 ha="center", va="center", color="white", fontsize=8, alpha=0.5)
 
     theta = np.linspace(0, 2*np.pi, 361)
@@ -967,7 +966,7 @@ def plot_model_diagram(p, summary=None):
     ax_top.set_ylabel("Anterior → Posterior  (m)", color=TC, fontsize=9)
     ax_top.set_title(
         f"SKIN SURFACE (top view, z = {Lz*1000:.0f} mm)\n"
-        f"Ankle polygon = actual FEM domain  |  r = {r_mid_mm:.0f} mm",
+        f"Dashed circles = current spreading pattern  |  r = {r_mid_mm:.0f} mm",
         color=TC, fontsize=9, fontweight="bold")
 
     # ─── Panel 3: |J| vs depth below active electrode ─────────────────────────
@@ -1080,6 +1079,73 @@ def plot_model_diagram(p, summary=None):
     ax.legend(facecolor="#222", edgecolor="white", labelcolor="white", fontsize=8,
               loc="lower right")
     ax.set_xlim(left=0)
+
+    # ─── Panel 4: 3D pyvista geometry render ──────────────────────────────────
+    import matplotlib.colors as _mc
+    _geo_img = None
+    if vtu_mesh is not None:
+        try:
+            _m   = vtu_mesh.copy()
+            _pts = np.array(_m.points)
+            # Tag nodes by tissue layer based on z depth
+            _z_fat_top = Lz - t_skin
+            _layer = np.zeros(_m.n_points, dtype=float)
+            _layer[_pts[:, 2] < z_fat_bot + 1e-4] = 0.0             # muscle
+            _layer[(_pts[:, 2] >= z_fat_bot) &
+                   (_pts[:, 2] <  _z_fat_top + 1e-4)] = 1.0         # fat
+            _layer[_pts[:, 2] >= _z_fat_top - 1e-4] = 2.0           # skin
+            _m.point_data["layer"] = _layer
+
+            _lcmap = _mc.ListedColormap([
+                LAYER_COLORS["muscle"], LAYER_COLORS["fat"], LAYER_COLORS["skin"]])
+
+            _pl3d = pv.Plotter(off_screen=True, window_size=(720, 580))
+            _pl3d.set_background(BG)
+            _pl3d.add_mesh(_m, scalars="layer", cmap=_lcmap, clim=[0, 2],
+                           show_scalar_bar=False, opacity=0.90)
+
+            # Electrode discs at skin top
+            _z_disc = Lz + t_contact + 0.001
+            for _xc, _yc, _clr in [(e1x, e1y, "cyan"), (e2x, e2y, "lime")]:
+                _disc = pv.Disc(center=(_xc, _yc, _z_disc),
+                                inner=0.0, outer=r_m,
+                                normal=(0, 0, 1), r_res=1, c_res=40)
+                _pl3d.add_mesh(_disc, color=_clr, opacity=0.95)
+                _pl3d.add_point_labels(
+                    np.array([[_xc, _yc, _z_disc + 0.003]]),
+                    ["+I" if _clr == "cyan" else "0V"],
+                    font_size=11, text_color=_clr, shape_color="black",
+                    show_points=False, always_visible=True)
+
+            # Semi-transparent layer boundary planes
+            for _zz in (z_fat_bot, _z_fat_top):
+                _plane = pv.Plane(center=(Lx/2, Ly/2, _zz),
+                                  direction=(0, 0, 1),
+                                  i_size=Lx * 1.1, j_size=Ly * 1.1,
+                                  i_resolution=1, j_resolution=1)
+                _pl3d.add_mesh(_plane, color="white", opacity=0.10)
+
+            _pl3d.camera_position = "iso"
+            _pl3d.camera.azimuth   = -25
+            _pl3d.camera.elevation =  20
+            _pl3d.camera.zoom(0.85)
+            _geo_img = _pl3d.screenshot(return_img=True)
+            _pl3d.close()
+        except Exception as _exc:
+            print(f"  model_diagram: 3D render failed: {_exc}")
+
+    if _geo_img is not None:
+        ax_3d.imshow(_geo_img)
+        ax_3d.set_title(
+            "3D ANKLE GEOMETRY (actual FEM mesh)\n"
+            f"Brown=muscle  Gold=fat  Tan=skin  |  {vtu_label or ''}",
+            color=TC, fontsize=9, fontweight="bold")
+    else:
+        ax_3d.text(0.5, 0.5, "3D geometry render\n(run sweep first)",
+                   ha="center", va="center", color="white", fontsize=11,
+                   transform=ax_3d.transAxes)
+        ax_3d.set_title("3D ANKLE GEOMETRY", color=TC, fontsize=9, fontweight="bold")
+    ax_3d.axis("off")
 
     fig.suptitle(
         "MODEL OVERVIEW — ankle 3-layer slab PTNS stimulation  "
