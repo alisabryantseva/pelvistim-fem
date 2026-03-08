@@ -21,6 +21,7 @@ All three J maps are always generated regardless of params.yaml flags.
 
 import json
 import yaml
+import datetime
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
@@ -304,11 +305,14 @@ def plot_J_surface_maps(summary, p):
         print(f"Saved → {out}")
         plt.close(fig)
 
+    _datestamp = datetime.date.today().isoformat()
+
     # ── Linear plot (always generated) ────────────────────────────────────────
     lin_norm   = mcolors.Normalize(vmin=vmin, vmax=vmax)
     lin_levels = np.linspace(vmin, vmax, 31)
     _render_figure(lin_norm, lin_levels, "J_surface_maps_linear.png",
-                   f"(linear, {vmax_pct:.2f}th pct max)")
+                   f"(linear, {vmax_pct:.2f}th pct max)",
+                   footer=f"Generated {_datestamp}")
 
     # ── Log-scale plot (always generated) ────────────────────────────────────
     pos_J      = [j for j in all_J if j > 0]
@@ -316,7 +320,8 @@ def plot_J_surface_maps(summary, p):
     log_norm   = mcolors.LogNorm(vmin=log_vmin, vmax=vmax)
     log_levels = np.logspace(np.log10(log_vmin), np.log10(vmax), 30)
     _render_figure(log_norm, log_levels, "J_surface_maps_log.png",
-                   "(log scale — reveals low-J spreading far from electrodes)")
+                   "(log scale — reveals low-J spreading far from electrodes)",
+                   footer=f"Generated {_datestamp}")
 
     # ── Masked-electrode plot (always generated) ──────────────────────────────
     def _mask_electrodes(Jvals, xp, yp, r_m):
@@ -546,6 +551,10 @@ def plot_3d_representative(summary, p):
     pl_pv.view_xy()          # top-down view so both pads are visible
     pl_pv.camera.zoom(1.05)
 
+    pl_pv.add_text(
+        f"Generated {datetime.date.today().isoformat()}",
+        position="lower_right", font_size=8, color="gray",
+    )
     out = RESULTS_DIR / "representative_3d.png"
     pl_pv.screenshot(str(out))
     pl_pv.close()
