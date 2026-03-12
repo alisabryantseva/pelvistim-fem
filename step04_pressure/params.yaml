@@ -1,0 +1,82 @@
+# step04_pressure/params.yaml
+# =============================================================================
+# PRESSURE-DEPENDENT CONTACT IMPEDANCE SWEEP
+# =============================================================================
+# Models how wrap tightness affects electrode-skin contact impedance and the
+# resulting current delivery, charge density, and tibial nerve E-field.
+#
+# Physical interpretation of sigma_contact:
+#   loose / no pressure  → poor electrode-skin coupling → low sigma (~0.0005 S/m)
+#   tight wrap / gel     → full contact, low impedance  → high sigma (~0.1 S/m)
+#
+# Fixed parameters (representative mid-point from step03):
+#   t_fat    = 5 mm
+#   elec_r   = 10 mm
+#   I        = 5 mA  @ 10 Hz, 200 µs pulse width
+#
+# ALL VALUES ARE PLACEHOLDERS — replace with measured impedance spectroscopy data.
+# =============================================================================
+
+geometry:
+  Lx: 0.080       # medial-lateral width (m)
+  Ly: 0.060       # anterior-posterior   (m)
+  Lz: 0.040       # total slab depth     (m)
+  cross_section: "rect"
+
+layers:
+  t_skin: 0.0015           # skin thickness (m) — PLACEHOLDER
+  t_fat:  0.005            # fat thickness  (m), fixed for this study
+
+# PLACEHOLDER conductivities.
+conductivities:
+  sigma_skin:    0.001    # S/m
+  sigma_fat:     0.040    # S/m
+  sigma_muscle:  0.350    # S/m
+
+# ── Contact layer (pressure-swept) ────────────────────────────────────────────
+# sigma_contact_Spm is overridden per-case by the pressure sweep.
+# t_contact_mm: physical thickness of electrode+hydrogel pad.
+contact:
+  enabled: true
+  model: "layer"
+  t_contact_mm: 0.5            # contact layer thickness (mm) — PLACEHOLDER
+  sigma_contact_Spm: 0.005     # default (overridden by sweep below)
+
+# ── Pressure sweep ────────────────────────────────────────────────────────────
+# sigma_contact values representing increasing wrap pressure.
+# Labels are qualitative — map to measured values when available.
+pressure_sweep:
+  sigma_contact_Spm: [0.0005, 0.001, 0.005, 0.020, 0.100]
+  labels: ["loose", "light", "normal", "firm", "tight"]
+
+# ── Electrode (fixed for this study) ──────────────────────────────────────────
+placement:
+  active_xy: [0.015, 0.045]    # m: medial-posterior corner
+  return_xy:  [0.065, 0.045]   # m: lateral-posterior corner
+  electrode_shape: "circle"
+  electrode_r_mm: 10.0         # fixed radius (mm)
+
+mesh:
+  lc_global_mm:    3.0
+  lc_electrode_mm: 1.5
+  lc_skin_min:     0.5
+
+roi:
+  z_target:   0.010   # tibial nerve depth below skin top (m) ~10 mm
+  roi_radius: 0.005   # ROI sphere radius (m)
+
+# ── Stimulation ───────────────────────────────────────────────────────────────
+stim:
+  control_mode:          "current"
+  injected_current_mA:   5.0
+  compliance_voltage_V:  200.0   # higher limit; loose electrode may need >100 V
+  frequency_Hz:          10.0    # PTNS standard
+  pulse_width_us:        200.0   # µs; used for charge density calculation
+
+solver:
+  tolerance:     1.0e-8
+  linear_solver: UMFPACK
+
+# ── Safety thresholds ─────────────────────────────────────────────────────────
+safety:
+  charge_density_limit_mC_cm2: 1.0   # irreversible tissue damage threshold

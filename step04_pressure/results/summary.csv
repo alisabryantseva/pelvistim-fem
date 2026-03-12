@@ -1,0 +1,2 @@
+pressure_label,sigma_contact_Spm,elec_r_mm,t_fat_mm,compliance_V,contact_impedance_ohm,exceeded_compliance,I_active_A,I_return_A,I_active_signed_A,I_return_signed_A,flux_err,jn_used_A_m2,peak_J_skin_with_elec,peak_J_skin_no_elec,charge_density_mC_cm2,exceeds_charge_limit,roi_mean_J,roi_mean_E,efficiency,roi_n_cells,roi_radius_used_mm,pulse_width_us,frequency_Hz
+normal,0.005,10.0,5.0,43.148,8191.6,False,0.00526731,0.00521078,-0.00526731,0.00521078,0.01073,16.155458,32.2563,32.2563,0.000645,False,8.20008,75.2133,2.331741,94,5.0,200.0,10.0

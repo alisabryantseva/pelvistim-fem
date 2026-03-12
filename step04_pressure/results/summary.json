@@ -1,0 +1,28 @@
+[
+  {
+    "pressure_label": "normal",
+    "sigma_contact_Spm": 0.005,
+    "elec_r_mm": 10.0,
+    "t_fat_mm": 5.0,
+    "compliance_V": 43.148,
+    "contact_impedance_ohm": 8191.6,
+    "exceeded_compliance": false,
+    "I_active_A": 0.00526731,
+    "I_return_A": 0.00521078,
+    "I_active_signed_A": -0.00526731,
+    "I_return_signed_A": 0.00521078,
+    "flux_err": 0.01073,
+    "jn_used_A_m2": 16.155458,
+    "peak_J_skin_with_elec": 32.2563,
+    "peak_J_skin_no_elec": 32.2563,
+    "charge_density_mC_cm2": 0.000645,
+    "exceeds_charge_limit": false,
+    "roi_mean_J": 8.20008,
+    "roi_mean_E": 75.2133,
+    "efficiency": 2.331741,
+    "roi_n_cells": 94,
+    "roi_radius_used_mm": 5.0,
+    "pulse_width_us": 200.0,
+    "frequency_Hz": 10.0
+  }
+]
