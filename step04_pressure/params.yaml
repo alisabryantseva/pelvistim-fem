@@ -6,8 +6,11 @@
 # resulting current delivery, charge density, and tibial nerve E-field.
 #
 # Physical interpretation of sigma_contact:
-#   loose / no pressure  → poor electrode-skin coupling → low sigma (~0.0005 S/m)
-#   tight wrap / gel     → full contact, low impedance  → high sigma (~0.1 S/m)
+#   p01 (5e-5 S/m)  — barely touching, dry skin, no pressure
+#   p08 (5e-3 S/m)  — normal clinical wrap
+#   p15 (0.5 S/m)   — saturated gel electrode, maximum coupling
+#
+# Range: 5e-5 to 0.5 S/m (15 log-spaced points)
 #
 # Fixed parameters (representative mid-point from step03):
 #   t_fat    = 5 mm
@@ -46,8 +49,15 @@ contact:
 # sigma_contact values representing increasing wrap pressure.
 # Labels are qualitative — map to measured values when available.
 pressure_sweep:
-  sigma_contact_Spm: [0.0005, 0.001, 0.005, 0.020, 0.100]
-  labels: ["loose", "light", "normal", "firm", "tight"]
+  sigma_contact_Spm: [0.00005, 0.00010, 0.00019, 0.00036, 0.00070,
+                      0.00134, 0.00260, 0.00501, 0.00968, 0.01868,
+                      0.03607, 0.06964, 0.13445, 0.25959, 0.50119]
+  labels: ["p01","p02","p03","p04","p05","p06","p07","p08",
+           "p09","p10","p11","p12","p13","p14","p15"]
+  # Compliance limit: PTNS/TENS device typically cannot exceed ~100 V
+  device_compliance_limit_V: 100.0
+  # Tibial nerve E-field activation threshold (literature: ~10–20 V/m for peripheral nerve)
+  nerve_threshold_V_per_m: 10.0
 
 # ── Electrode (fixed for this study) ──────────────────────────────────────────
 placement:
