@@ -1,0 +1,111 @@
+Header
+  CHECK KEYWORDS Warn
+  Mesh DB "." "elmer_mesh"
+  Include Path ""
+  Results Directory "results"
+End
+
+Simulation
+  Max Output Level = 3
+  Coordinate System = Cartesian 3D
+  Coordinate Mapping(3) = 1 2 3
+  Simulation Type = Steady State
+  Steady State Max Iterations = 1
+  Output Intervals = 1
+End
+
+Constants
+  Permittivity of Vacuum = 8.8542e-12
+End
+
+Equation 1
+  Name = "Conduction"
+  Active Solvers(2) = 1 2
+End
+
+Solver 1
+  Equation = "Static Current Conduction"
+  Procedure = "StatCurrentSolve" "StatCurrentSolver"
+  Variable = "Potential"
+  Variable DOFs = 1
+  Calculate Volume Current = True
+  Linear System Solver = Direct
+  Linear System Direct Method = UMFPACK
+  Steady State Convergence Tolerance = 1e-08
+End
+
+Solver 2
+  Equation = "ResultOutput"
+  Procedure = "ResultOutputSolve" "ResultOutputSolver"
+  Output File Name = "case"
+  Output Format = VTU
+  VTU Format = Logical True
+  Save Geometry IDs = Logical True
+End
+
+Body 1
+  Name = "muscle"
+  Target Bodies(1) = 1
+  Equation = 1
+  Material = 1
+End
+
+Body 2
+  Name = "fat"
+  Target Bodies(1) = 2
+  Equation = 1
+  Material = 2
+End
+
+Body 3
+  Name = "skin"
+  Target Bodies(1) = 3
+  Equation = 1
+  Material = 3
+End
+
+Body 4
+  Name = "contact_active"
+  Target Bodies(1) = 4
+  Equation = 1
+  Material = 4
+End
+
+Body 5
+  Name = "contact_return"
+  Target Bodies(1) = 5
+  Equation = 1
+  Material = 4
+End
+
+Material 1
+  Name = "muscle"
+  Electric Conductivity = 0.35
+End
+
+Material 2
+  Name = "fat"
+  Electric Conductivity = 0.04
+End
+
+Material 3
+  Name = "skin"
+  Electric Conductivity = 0.001
+End
+
+Material 4
+  Name = "contact"
+  Electric Conductivity = 0.02   ! pressure-dependent — PLACEHOLDER
+End
+
+Boundary Condition 1
+  Name = "active_electrode"
+  Target Boundaries = 101
+  Current Density = 1.597501e+01   ! I=5.0mA, A_mesh=3.1299cm²
+End
+
+Boundary Condition 2
+  Name = "return_electrode"
+  Target Boundaries = 102
+  Potential = 0.0
+End
