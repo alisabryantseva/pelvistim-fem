@@ -126,7 +126,7 @@ def plot_J_surface_maps(summary, p):
         # Skin surface: top 20% of skin layer depth (handles uneven top surface)
         _t_skin = p["layers"]["t_skin"]
         mask = pts[:, 2] > (Lz - _t_skin) + _t_skin * 0.80
-        all_J.extend(Jmag[mask].tolist())
+        all_J.extend((Jmag[mask] * 0.1).tolist())  # A/m² → mA/cm²
         meshes[(row["t_fat_mm"], row["elec_r_mm"])] = (pts, Jmag, mask)
 
     if not all_J:
@@ -164,7 +164,7 @@ def plot_J_surface_maps(summary, p):
             f"|J| at skin surface (z = Lz)  —  ankle layered model  {title_suffix}\n"
             f"σ_skin={sig_skin} S/m  fat={p['conductivities']['sigma_fat']} S/m  "
             f"muscle={p['conductivities']['sigma_muscle']} S/m  [PLACEHOLDER values]\n"
-            f"Color scale: {vmin:.2g} – {vmax:.4f} A/m²  "
+            f"Color scale: {vmin:.2g} – {vmax:.4f} mA/cm²  "
             f"({vmax_pct:.2f}th percentile max)   [black = outside domain or masked]",
             fontsize=9, fontweight="bold"
         )
@@ -186,7 +186,7 @@ def plot_J_surface_maps(summary, p):
                 pts, Jmag, smask = meshes[key]
                 xp     = pts[smask, 0]
                 yp     = pts[smask, 1]
-                Jvals  = Jmag[smask].copy()
+                Jvals  = Jmag[smask].copy() * 0.1  # A/m² → mA/cm²
 
                 if mask_fn is not None:
                     r_m   = r_mm / 1000.0
@@ -279,9 +279,10 @@ def plot_J_surface_maps(summary, p):
 
                 ax.set_xlim(0, Lx); ax.set_ylim(0, Ly)
                 ax.set_aspect("equal")
-                # Anatomical direction labels
-                ax.set_xlabel("Medial → Lateral  (m)", fontsize=7)
-                ax.set_ylabel("Anterior → Posterior  (m)", fontsize=7)
+                ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v*100:.0f}"))
+                ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v*100:.0f}"))
+                ax.set_xlabel("Medial → Lateral  (cm)", fontsize=7)
+                ax.set_ylabel("Anterior → Posterior  (cm)", fontsize=7)
 
                 pk  = row.get("peak_J_skin_no_elec",
                               row.get("peak_J_skin", float("nan")))
@@ -289,13 +290,13 @@ def plot_J_surface_maps(summary, p):
                 ax.set_title(
                     f"fat={tfat:.0f} mm  |  r={r_mm:.0f} mm\n"
                     f"σ_skin={row.get('sigma_skin', sig_skin)}\n"
-                    f"peak|J|(no-elec)={pk:.4f}  ROI|J|={rj:.4f} A/m²",
+                    f"peak|J|(no-elec)={pk*0.1:.4f}  ROI|J|={rj*0.1:.4f} mA/cm²",
                     fontsize=7.5
                 )
 
         sm = plt.cm.ScalarMappable(cmap=_cmap, norm=norm)
         sm.set_array([])
-        fig.colorbar(sm, ax=axes, label="|J| (A/m²)", shrink=0.6, pad=0.01)
+        fig.colorbar(sm, ax=axes, label="|J| (mA/cm²)", shrink=0.6, pad=0.01)
 
         if footer:
             fig.text(0.5, -0.01, footer, ha="center", va="top",
@@ -366,8 +367,8 @@ def plot_summary_metrics(summary, p):
     raw_panels = [
         ("Skin peak |J| (no-electrode, comfort proxy)\n"
          "Smaller electrode → higher peak → more discomfort risk",
-         "peak_J_skin_no_elec",
-         "Peak |J| outside electrode (A/m²)"),
+         "peak_J_skin_no_elec_mAcm2",
+         "Peak |J| outside electrode (mA/cm²)"),
         (f"ROI mean |E|  (efficacy proxy)\n"
          f"Sphere r={roi_r_mm:.0f}mm at {z_tgt_mm:.0f}mm depth",
          "roi_mean_E",
@@ -431,6 +432,9 @@ def plot_summary_metrics(summary, p):
                 if key == "total_current_A_mA":
                     v_raw = r.get("total_current_A")
                     v = v_raw * 1e3 if (v_raw is not None and not (isinstance(v_raw, float) and np.isnan(v_raw))) else None
+                elif key == "peak_J_skin_no_elec_mAcm2":
+                    v_raw = r.get("peak_J_skin_no_elec")
+                    v = v_raw * 0.1 if (v_raw is not None and not (isinstance(v_raw, float) and np.isnan(v_raw))) else None
                 else:
                     v = r.get(key)
                 if v is None or (isinstance(v, float) and np.isnan(v)):
@@ -724,8 +728,10 @@ def plot_depth_slice_E_maps(summary, p):
 
             ax.set_xlim(0, Lx); ax.set_ylim(0, Ly)
             ax.set_aspect("equal")
-            ax.set_xlabel("Medial → Lateral  (m)", fontsize=7)
-            ax.set_ylabel("Anterior → Posterior  (m)", fontsize=7)
+            ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v*100:.0f}"))
+            ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v*100:.0f}"))
+            ax.set_xlabel("Medial → Lateral  (cm)", fontsize=7)
+            ax.set_ylabel("Anterior → Posterior  (cm)", fontsize=7)
             re_val = row.get("roi_mean_E", float("nan"))
             ax.set_title(
                 f"fat={tfat:.0f} mm  |  r={r_mm:.0f} mm\n"
@@ -894,8 +900,10 @@ def plot_model_diagram(p, summary=None):
 
     ax_side.set_xlim(-0.004, Lx + 0.022)
     ax_side.set_ylim(-0.003, Lz + t_contact + 0.010)
-    ax_side.set_xlabel("Medial → Lateral  (m)", color=TC, fontsize=9)
-    ax_side.set_ylabel("Depth z  (m,  0=base → Lz=skin top)", color=TC, fontsize=9)
+    ax_side.xaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v*100:.0f}"))
+    ax_side.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v*100:.0f}"))
+    ax_side.set_xlabel("Medial → Lateral  (cm)", color=TC, fontsize=9)
+    ax_side.set_ylabel("Depth z  (cm,  0=base → Lz=skin top)", color=TC, fontsize=9)
     ax_side.set_title(
         "ANATOMY (side view, x–z plane)\n"
         "Cyan/lime arrows = current IN / OUT of tissue",
@@ -965,8 +973,10 @@ def plot_model_diagram(p, summary=None):
     ax_top.set_xlim(-0.002, Lx+0.002)
     ax_top.set_ylim(-0.002, Ly+0.002)
     ax_top.set_aspect("equal")
-    ax_top.set_xlabel("Medial → Lateral  (m)", color=TC, fontsize=9)
-    ax_top.set_ylabel("Anterior → Posterior  (m)", color=TC, fontsize=9)
+    ax_top.xaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v*100:.0f}"))
+    ax_top.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v*100:.0f}"))
+    ax_top.set_xlabel("Medial → Lateral  (cm)", color=TC, fontsize=9)
+    ax_top.set_ylabel("Anterior → Posterior  (cm)", color=TC, fontsize=9)
     ax_top.set_title(
         f"SKIN SURFACE (top view, z = {Lz*1000:.0f} mm)\n"
         f"Dashed circles = current spreading pattern  |  r = {r_mid_mm:.0f} mm",

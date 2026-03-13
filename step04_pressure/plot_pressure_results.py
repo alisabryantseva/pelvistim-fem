@@ -50,10 +50,10 @@ def main():
     charge_limit      = 1.0     # mC/cm² — irreversible tissue damage
     nerve_thresh_E    = 10.0    # V/m — peripheral nerve activation threshold (literature)
 
-    # x-tick positions: every other label to avoid crowding
+    # x-tick positions: every other point to avoid crowding; show sigma values
     tick_idx  = list(range(0, len(x), 2))
     x_ticks   = [x[i] for i in tick_idx]
-    x_labels  = [labels[i] for i in tick_idx]
+    x_labels  = [f"{sigma_c[i]:.1e}" for i in tick_idx]
 
     fig, axes = plt.subplots(2, 2, figsize=(13, 9))
     fig.patch.set_facecolor("black")
